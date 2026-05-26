@@ -17,9 +17,12 @@ copy /y run_one_click_exe.bat dist\CZNAuto\run_one_click.bat >nul
 copy /y stop_czn_auto_exe.bat dist\CZNAuto\stop_czn_auto.bat >nul
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\CZNAuto\*' -DestinationPath 'dist\CZNAuto-portable.zip' -Force"
 
-where ISCC >nul 2>nul
-if %errorlevel% equ 0 (
-  ISCC installer\czn_auto.iss
+set "ISCC_EXE="
+where ISCC >nul 2>nul && set "ISCC_EXE=ISCC"
+if not defined ISCC_EXE if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
+
+if defined ISCC_EXE (
+  "%ISCC_EXE%" installer\czn_auto.iss
 ) else (
   echo Inno Setup compiler ISCC was not found. Skipping installer build.
   echo Portable app is ready at: dist\CZNAuto
