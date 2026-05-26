@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+debug_crops/
+debug_live/
+out/
+out_*/
+out_video*/
+
+STOP
+.venv/
+venv/
