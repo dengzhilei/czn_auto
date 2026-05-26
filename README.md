@@ -117,6 +117,8 @@ Template matching uses a faster single-scale search by default. If UI detection 
 --wide-match-scales
 ```
 
+Resolution compatibility assumes same-ratio fullscreen capture. 4K `3840x2160`, 2K `2560x1440`, and 1080P `1920x1080` all use the same normalized ROIs/click points, while templates are scaled from the 4K base size. If the game is windowed, letterboxed, or not 16:9, the detector will print an aspect-ratio warning and matching/clicking may need new templates or window-specific coordinates.
+
 Dialog advance bursts are intentionally blind now: after team enter arms the dialog step, the script sends the configured taps continuously, then returns to visual detection after the burst. Unknown screens outside the main -> team -> dialog flow will not trigger the burst.
 
 After clicking team enter, blind dialog bursts are delayed by the Python default:

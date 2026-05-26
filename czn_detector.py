@@ -14,6 +14,8 @@ import numpy as np
 
 BASE_W = 3840
 BASE_H = 2160
+BASE_ASPECT = BASE_W / BASE_H
+ASPECT_TOLERANCE = 0.03
 _DXGI_CAMERAS: dict[int, object] = {}
 
 
@@ -240,6 +242,7 @@ class CznDetector:
         root = Path(__file__).resolve().parent
         self.template_dir = template_dir or root / "templates"
         self.match_scale_factors = WIDE_MATCH_SCALE_FACTORS if wide_match_scales else FAST_MATCH_SCALE_FACTORS
+        self._warned_aspect_sizes: set[tuple[int, int]] = set()
         self.legend_template = self._load_template("legend_word.jpg")
         self.legend_wide_template = self._load_template("legend_word_wide.jpg")
         self.dream_template = self._load_template("dream_border_title.jpg")
@@ -261,6 +264,7 @@ class CznDetector:
     def detect(self, frame_bgr: np.ndarray) -> DetectionState:
         frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         h, w = frame_bgr.shape[:2]
+        self._warn_if_unexpected_aspect(w, h)
         dream = self._match_in_roi(
             frame_gray,
             self.dream_template,
@@ -399,7 +403,7 @@ class CznDetector:
         if haystack.size == 0:
             return None
 
-        base_scale = w / BASE_W
+        base_scale = self._template_scale(w, h)
         best_score = -1.0
         best_loc = (0, 0)
         best_size = (0, 0)
@@ -427,6 +431,23 @@ class CznDetector:
             score=float(max_score),
             box=(x1 + mx, y1 + my, x1 + mx + tw, y1 + my + th),
         )
+
+    def _template_scale(self, width: int, height: int) -> float:
+        # For same-aspect fullscreen captures, 4K/2K/1080P share one uniform UI scale.
+        return min(width / BASE_W, height / BASE_H)
+
+    def _warn_if_unexpected_aspect(self, width: int, height: int) -> None:
+        size = (width, height)
+        if size in self._warned_aspect_sizes:
+            return
+        self._warned_aspect_sizes.add(size)
+        aspect = width / max(1, height)
+        if abs(aspect - BASE_ASPECT) > ASPECT_TOLERANCE:
+            print(
+                f"warning: capture aspect {width}x{height} differs from base {BASE_W}x{BASE_H}; "
+                "same-ratio 16:9 fullscreen captures are expected.",
+                flush=True,
+            )
 
 
 def read_image(path: Path) -> np.ndarray:
