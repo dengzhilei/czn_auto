@@ -944,6 +944,365 @@ def sleep_interruptible(seconds: float, stop_keys: list[str], stop_file: Path | 
     return False
 
 
+@dataclasses.dataclass(frozen=True)
+class LiveConfig:
+    detector: CznDetector
+    act: bool
+    interval: float
+    no_dream_action: str
+    max_seconds: float
+    monitor_index: int
+    advance_on_unknown: bool
+    stop_keys: list[str]
+    max_clicks: int
+    stop_file: Path | None
+    post_click_wait: float
+    capture_method: str
+    fast_start_to_team_enabled: bool
+    log_interval: float
+    wait_after_team_enter: float
+
+
+@dataclasses.dataclass
+class LiveRuntime:
+    last_action: float = 0.0
+    next_action_delay: float = INITIAL_ACTION_DELAY
+    started: float = dataclasses.field(default_factory=time.time)
+    printed_monitor: bool = False
+    waiting_after_legend: bool = False
+    waiting_after_reward_action: bool = False
+    handled_choice_without_legend: bool = False
+    handled_start_screen: bool = False
+    pending_legend_confirm_point: tuple[int, int] | None = None
+    click_count: int = 0
+    last_logged_state: str = ""
+    last_log_time: float = 0.0
+    wait_for_dialog_until: float = 0.0
+    dialog_advance_armed: bool = False
+
+
+class LiveSession:
+    def __init__(self, config: LiveConfig) -> None:
+        self.config = config
+        self.runtime = LiveRuntime()
+
+    def run(self) -> None:
+        cfg = self.config
+        print(
+            f"live mode started. capture={cfg.capture_method}. Stop keys: {', '.join(k.upper() for k in cfg.stop_keys)}. "
+            "Dry-run is ON unless --act is passed."
+        )
+        if cfg.stop_file and cfg.stop_file.exists():
+            cfg.stop_file.unlink()
+
+        while True:
+            if self.should_stop():
+                return
+            frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method)
+            if not self.runtime.printed_monitor:
+                print(f"using monitor {cfg.monitor_index}: {monitor}")
+                self.runtime.printed_monitor = True
+            state = cfg.detector.detect(frame)
+            now = time.time()
+            self.log_state(now, state)
+            if now - self.runtime.last_action >= self.runtime.next_action_delay:
+                if not self.handle_state(frame, monitor, state, now):
+                    return
+            if sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file):
+                return
+
+    def should_stop(self) -> bool:
+        cfg = self.config
+        rt = self.runtime
+        if stop_requested(cfg.stop_keys, cfg.stop_file):
+            return True
+        if cfg.max_seconds > 0 and time.time() - rt.started >= cfg.max_seconds:
+            print("live mode max seconds reached; exiting.")
+            return True
+        if cfg.max_clicks > 0 and rt.click_count >= cfg.max_clicks:
+            print("live mode max clicks reached; exiting.")
+            return True
+        return False
+
+    def log_state(self, now: float, state: DetectionState) -> None:
+        rt = self.runtime
+        if state.label != rt.last_logged_state or now - rt.last_log_time >= self.config.log_interval:
+            print_state(time.strftime("%H:%M:%S"), state)
+            rt.last_logged_state = state.label
+            rt.last_log_time = now
+
+    def mark_action(self, now: float, delay: float) -> None:
+        self.runtime.last_action = now
+        self.runtime.next_action_delay = delay
+
+    def disarm_dialog(self) -> None:
+        self.runtime.dialog_advance_armed = False
+        self.runtime.wait_for_dialog_until = 0.0
+
+    def reset_common(
+        self,
+        *,
+        legend: bool = True,
+        reward: bool = True,
+        choice: bool = True,
+        start: bool = True,
+        dialog: bool = True,
+    ) -> None:
+        rt = self.runtime
+        if dialog:
+            self.disarm_dialog()
+        if legend:
+            rt.waiting_after_legend = False
+            rt.pending_legend_confirm_point = None
+        if reward:
+            rt.waiting_after_reward_action = False
+        if choice:
+            rt.handled_choice_without_legend = False
+        if start:
+            rt.handled_start_screen = False
+
+    def wait_visual(
+        self,
+        frame: np.ndarray,
+        action_name: str,
+        expected_labels: set[str],
+    ) -> None:
+        cfg = self.config
+        wait_visual_change(
+            cfg.detector,
+            frame,
+            cfg.monitor_index,
+            cfg.capture_method,
+            cfg.stop_keys,
+            cfg.stop_file,
+            cfg.post_click_wait,
+            action_name=action_name,
+            expected_labels=expected_labels,
+        )
+
+    def handle_state(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
+        if state.dream_card:
+            return self.handle_dream_card()
+        if state.card_reward:
+            return self.handle_card_reward(frame, monitor, state, now)
+        if state.return_confirm:
+            return self.handle_return_confirm(frame, monitor, state, now)
+        if state.legend_choice:
+            return self.handle_legend_choice(frame, monitor, state, now)
+        if state.choice_card:
+            return self.handle_choice_screen(frame, monitor, now)
+        if state.flee_button:
+            return self.handle_flee_screen(frame, monitor, state, now)
+        if state.team_enter:
+            return self.handle_team_enter(monitor, state, now)
+        if state.start_screen:
+            return self.handle_start_screen(frame, monitor, state, now)
+        return self.handle_unknown(monitor, now)
+
+    def handle_dream_card(self) -> bool:
+        self.disarm_dialog()
+        print("dream card found; stopping automation loop.")
+        return False
+
+    def handle_card_reward(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
+        cfg = self.config
+        rt = self.runtime
+        self.reset_common(legend=True, reward=False, choice=True, start=True, dialog=True)
+        if not rt.waiting_after_reward_action and REWARD_SETTLE_BEFORE_ACTION > 0:
+            print(f"reward screen: settle {REWARD_SETTLE_BEFORE_ACTION:.1f}s before checking cards.")
+            if sleep_interruptible(REWARD_SETTLE_BEFORE_ACTION, cfg.stop_keys, cfg.stop_file):
+                return False
+            frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method)
+            state = cfg.detector.detect(frame)
+            print_state("reward settle", state)
+            if state.dream_card:
+                print("dream card found after reward settle; stopping automation loop.")
+                return False
+            if not state.card_reward:
+                self.mark_action(time.time(), cfg.interval)
+                return True
+        if rt.waiting_after_reward_action:
+            print("reward screen already handled once; waiting for screen to change.")
+            self.mark_action(now, DELAY_REWARD_ALREADY_HANDLED)
+            return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
+
+        if cfg.no_dream_action == "retry-top-right":
+            retry_point = state.top_right_menu.center if state.top_right_menu else None
+            print_action("no dream card: click top-right retry/menu area", CLICK_RETRY_TOP_RIGHT, cfg.act)
+            if cfg.act:
+                if retry_point:
+                    click_frame_point(retry_point, monitor)
+                else:
+                    click_norm(CLICK_RETRY_TOP_RIGHT, monitor)
+                rt.click_count += 1
+                self.wait_visual(frame, "reward_retry", {"flee_screen", "start_screen", "team_screen", "unknown"})
+        elif cfg.no_dream_action == "confirm":
+            print_action("no dream card: click confirm", CLICK_CONFIRM, cfg.act)
+            if cfg.act:
+                click_norm(CLICK_CONFIRM, monitor)
+                rt.click_count += 1
+                self.wait_visual(frame, "reward_confirm", {"start_screen", "team_screen", "unknown"})
+        else:
+            print("no dream card: reward screen detected; no action configured.")
+
+        rt.waiting_after_reward_action = True
+        self.mark_action(now, DELAY_AFTER_REWARD_ACTION)
+        return True
+
+    def handle_return_confirm(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
+        cfg = self.config
+        self.reset_common()
+        confirm_point = state.return_confirm.point_at(0.68, 0.50)
+        print_action(f"return confirm: click confirm at {confirm_point}", CLICK_CONFIRM, cfg.act)
+        if cfg.act:
+            click_frame_point(confirm_point, monitor)
+            self.runtime.click_count += 1
+            self.wait_visual(frame, "return_confirm", {"start_screen", "team_screen", "unknown"})
+        self.mark_action(now, DELAY_AFTER_RETURN_CONFIRM)
+        return True
+
+    def handle_legend_choice(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
+        cfg = self.config
+        rt = self.runtime
+        self.reset_common(legend=False, reward=True, choice=True, start=True, dialog=True)
+        if rt.waiting_after_legend:
+            if rt.pending_legend_confirm_point is None:
+                rt.pending_legend_confirm_point = choice_confirm_point_for(state.legend_choice.center, frame.shape)
+            print_action(f"legend option selected: click check at {rt.pending_legend_confirm_point}", CLICK_CONFIRM, cfg.act)
+            if cfg.act:
+                click_frame_point(rt.pending_legend_confirm_point, monitor)
+                rt.click_count += 1
+                self.wait_visual(frame, "legend_confirm", {"card_reward", "dream_found"})
+            rt.waiting_after_legend = False
+            rt.pending_legend_confirm_point = None
+            self.mark_action(now, DELAY_AFTER_LEGEND_CONFIRM)
+            return True
+
+        print_action(f"click matched legend option at {state.legend_choice.center}", CLICK_CHOICE_RIGHT, cfg.act)
+        if cfg.act:
+            rt.pending_legend_confirm_point = choice_confirm_point_for(state.legend_choice.center, frame.shape)
+            click_frame_point(state.legend_choice.center, monitor)
+            rt.click_count += 1
+            if sleep_interruptible(LEGEND_CONFIRM_DELAY, cfg.stop_keys, cfg.stop_file):
+                return False
+            print_action(f"legend option confirm: click check at {rt.pending_legend_confirm_point}", CLICK_CONFIRM, cfg.act)
+            click_frame_point(rt.pending_legend_confirm_point, monitor)
+            rt.click_count += 1
+            self.wait_visual(frame, "legend_confirm", {"card_reward", "dream_found"})
+        else:
+            rt.pending_legend_confirm_point = choice_confirm_point_for(state.legend_choice.center, frame.shape)
+        rt.waiting_after_legend = False
+        rt.pending_legend_confirm_point = None
+        self.mark_action(now, DELAY_AFTER_LEGEND_CONFIRM)
+        return True
+
+    def handle_choice_screen(self, frame: np.ndarray, monitor: dict, now: float) -> bool:
+        cfg = self.config
+        rt = self.runtime
+        self.reset_common(reward=True, choice=False, start=True, dialog=True)
+        if rt.handled_choice_without_legend:
+            print("choice screen without legend already handled once; waiting for screen to change.")
+            self.mark_action(now, DELAY_CHOICE_ALREADY_HANDLED)
+            return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
+        rt.click_count += fast_abandon_no_legend(
+            cfg.detector,
+            frame,
+            monitor,
+            cfg.monitor_index,
+            cfg.capture_method,
+            cfg.stop_keys,
+            cfg.stop_file,
+            cfg.act,
+        )
+        rt.handled_choice_without_legend = True
+        self.mark_action(now, DELAY_AFTER_NO_LEGEND_CHAIN)
+        return True
+
+    def handle_flee_screen(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
+        cfg = self.config
+        self.reset_common()
+        flee_point = state.flee_button.point_at(0.72, 0.50)
+        print_action(f"flee screen: click flee text area at {flee_point}", CLICK_ADVANCE, cfg.act)
+        if cfg.act:
+            click_frame_point(flee_point, monitor)
+            self.runtime.click_count += 1
+            self.wait_visual(frame, "flee", {"return_confirm", "unknown"})
+        self.mark_action(now, DELAY_AFTER_FLEE)
+        return True
+
+    def handle_team_enter(self, monitor: dict, state: DetectionState, now: float) -> bool:
+        cfg = self.config
+        rt = self.runtime
+        self.reset_common(dialog=False)
+        print_action(f"team screen: click enter at {state.team_enter.center}", CLICK_START_ENTER, cfg.act)
+        if cfg.act:
+            click_frame_point(state.team_enter.center, monitor)
+            rt.click_count += 1
+        rt.wait_for_dialog_until = time.time() + cfg.wait_after_team_enter
+        rt.dialog_advance_armed = True
+        print(f"team enter clicked; dialog advance armed after {cfg.wait_after_team_enter:.1f}s.")
+        self.mark_action(now, min(max(cfg.wait_after_team_enter, cfg.interval), 1.0))
+        return True
+
+    def handle_start_screen(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
+        cfg = self.config
+        rt = self.runtime
+        self.reset_common(choice=True, start=False, dialog=True)
+        if rt.handled_start_screen:
+            print("start screen already clicked once; waiting for screen to change.")
+            self.mark_action(now, DELAY_START_ALREADY_HANDLED)
+            return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
+        click_point = state.start_screen.center
+        if cfg.fast_start_to_team_enabled:
+            rt.click_count += fast_start_to_team(
+                monitor,
+                cfg.stop_keys,
+                cfg.stop_file,
+                cfg.act,
+                first_point=click_point,
+            )
+        else:
+            print_action(f"start screen: click enter at {click_point}", CLICK_START_ENTER, cfg.act)
+            if cfg.act:
+                click_frame_point(click_point, monitor)
+                rt.click_count += 1
+                self.wait_visual(frame, "start_enter", {"team_screen", "unknown"})
+        rt.handled_start_screen = True
+        self.mark_action(now, DELAY_AFTER_START_ENTER)
+        return True
+
+    def handle_unknown(self, monitor: dict, now: float) -> bool:
+        cfg = self.config
+        rt = self.runtime
+        self.reset_common(dialog=False)
+        if not cfg.advance_on_unknown:
+            print("unknown screen: no click. Pass --advance-on-unknown to enable blind advance clicks.")
+            self.mark_action(now, DELAY_UNKNOWN_IDLE)
+            return True
+        if not rt.dialog_advance_armed:
+            print("unknown screen: dialog advance is not armed; waiting for a team enter first.")
+            self.mark_action(now, DELAY_UNKNOWN_IDLE)
+            return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
+        if rt.wait_for_dialog_until > now:
+            remaining = rt.wait_for_dialog_until - now
+            print(f"unknown screen: waiting {remaining:.1f}s before dialog advance burst.")
+            self.mark_action(now, min(max(remaining, cfg.interval), 1.0))
+            return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
+        rt.wait_for_dialog_until = 0.0
+        rt.click_count += fast_advance_unknown(
+            cfg.detector,
+            monitor,
+            cfg.monitor_index,
+            cfg.capture_method,
+            cfg.stop_keys,
+            cfg.stop_file,
+            cfg.act,
+        )
+        rt.dialog_advance_armed = False
+        self.mark_action(now, DELAY_AFTER_UNKNOWN_BURST)
+        return True
+
+
 def run_live(
     detector: CznDetector,
     act: bool,
@@ -962,353 +1321,25 @@ def run_live(
     wait_after_team_enter: float,
 ) -> None:
     stop_keys = parse_stop_keys(stop_key)
-    print(
-        f"live mode started. capture={capture_method}. Stop keys: {', '.join(k.upper() for k in stop_keys)}. "
-        "Dry-run is ON unless --act is passed."
-    )
-    if stop_file and stop_file.exists():
-        stop_file.unlink()
-    last_action = 0.0
-    next_action_delay = INITIAL_ACTION_DELAY
-    started = time.time()
-    printed_monitor = False
-    waiting_after_legend = False
-    waiting_after_reward_action = False
-    handled_choice_without_legend = False
-    handled_start_screen = False
-    pending_legend_confirm_point: tuple[int, int] | None = None
-    click_count = 0
-    last_logged_state = ""
-    last_log_time = 0.0
-    wait_for_dialog_until = 0.0
-    dialog_advance_armed = False
-    while True:
-        if stop_requested(stop_keys, stop_file):
-            return
-        if max_seconds > 0 and time.time() - started >= max_seconds:
-            print("live mode max seconds reached; exiting.")
-            return
-        if max_clicks > 0 and click_count >= max_clicks:
-            print("live mode max clicks reached; exiting.")
-            return
-        frame, monitor = screen_shot(monitor_index, capture_method)
-        if not printed_monitor:
-            print(f"using monitor {monitor_index}: {monitor}")
-            printed_monitor = True
-        state = detector.detect(frame)
-        now = time.time()
-        if state.label != last_logged_state or now - last_log_time >= log_interval:
-            print_state(time.strftime("%H:%M:%S"), state)
-            last_logged_state = state.label
-            last_log_time = now
-        if now - last_action >= next_action_delay:
-            if state.dream_card:
-                dialog_advance_armed = False
-                wait_for_dialog_until = 0.0
-                print("dream card found; stopping automation loop.")
-                return
-            elif state.card_reward:
-                dialog_advance_armed = False
-                wait_for_dialog_until = 0.0
-                waiting_after_legend = False
-                pending_legend_confirm_point = None
-                handled_choice_without_legend = False
-                handled_start_screen = False
-                if not waiting_after_reward_action and REWARD_SETTLE_BEFORE_ACTION > 0:
-                    print(f"reward screen: settle {REWARD_SETTLE_BEFORE_ACTION:.1f}s before checking cards.")
-                    if sleep_interruptible(REWARD_SETTLE_BEFORE_ACTION, stop_keys, stop_file):
-                        return
-                    frame, monitor = screen_shot(monitor_index, capture_method)
-                    state = detector.detect(frame)
-                    print_state("reward settle", state)
-                    if state.dream_card:
-                        print("dream card found after reward settle; stopping automation loop.")
-                        return
-                    if not state.card_reward:
-                        last_action = time.time()
-                        next_action_delay = interval
-                        continue
-                if waiting_after_reward_action:
-                    print("reward screen already handled once; waiting for screen to change.")
-                    last_action = now
-                    next_action_delay = DELAY_REWARD_ALREADY_HANDLED
-                    if sleep_interruptible(interval, stop_keys, stop_file):
-                        return
-                    continue
-                if no_dream_action == "retry-top-right":
-                    retry_point = state.top_right_menu.center if state.top_right_menu else None
-                    print_action("no dream card: click top-right retry/menu area", CLICK_RETRY_TOP_RIGHT, act)
-                    if act:
-                        if retry_point:
-                            click_frame_point(retry_point, monitor)
-                        else:
-                            click_norm(CLICK_RETRY_TOP_RIGHT, monitor)
-                        click_count += 1
-                        wait_visual_change(
-                            detector,
-                            frame,
-                            monitor_index,
-                            capture_method,
-                            stop_keys,
-                            stop_file,
-                            post_click_wait,
-                            action_name="reward_retry",
-                            expected_labels={"flee_screen", "start_screen", "team_screen", "unknown"},
-                        )
-                elif no_dream_action == "confirm":
-                    print_action("no dream card: click confirm", CLICK_CONFIRM, act)
-                    if act:
-                        click_norm(CLICK_CONFIRM, monitor)
-                        click_count += 1
-                        wait_visual_change(
-                            detector,
-                            frame,
-                            monitor_index,
-                            capture_method,
-                            stop_keys,
-                            stop_file,
-                            post_click_wait,
-                            action_name="reward_confirm",
-                            expected_labels={"start_screen", "team_screen", "unknown"},
-                        )
-                else:
-                    print("no dream card: reward screen detected; no action configured.")
-                last_action = now
-                waiting_after_reward_action = True
-                next_action_delay = DELAY_AFTER_REWARD_ACTION
-            elif state.return_confirm:
-                dialog_advance_armed = False
-                wait_for_dialog_until = 0.0
-                waiting_after_legend = False
-                pending_legend_confirm_point = None
-                waiting_after_reward_action = False
-                handled_choice_without_legend = False
-                handled_start_screen = False
-                confirm_point = state.return_confirm.point_at(0.68, 0.50)
-                print_action(f"return confirm: click confirm at {confirm_point}", CLICK_CONFIRM, act)
-                if act:
-                    click_frame_point(confirm_point, monitor)
-                    click_count += 1
-                    wait_visual_change(
-                        detector,
-                        frame,
-                        monitor_index,
-                        capture_method,
-                        stop_keys,
-                        stop_file,
-                        post_click_wait,
-                        action_name="return_confirm",
-                        expected_labels={"start_screen", "team_screen", "unknown"},
-                    )
-                last_action = now
-                next_action_delay = DELAY_AFTER_RETURN_CONFIRM
-            elif state.legend_choice:
-                dialog_advance_armed = False
-                wait_for_dialog_until = 0.0
-                waiting_after_reward_action = False
-                handled_choice_without_legend = False
-                handled_start_screen = False
-                if waiting_after_legend:
-                    if pending_legend_confirm_point is None:
-                        pending_legend_confirm_point = choice_confirm_point_for(state.legend_choice.center, frame.shape)
-                    print_action(f"legend option selected: click check at {pending_legend_confirm_point}", CLICK_CONFIRM, act)
-                    if act:
-                        click_frame_point(pending_legend_confirm_point, monitor)
-                        click_count += 1
-                        wait_visual_change(
-                            detector,
-                            frame,
-                            monitor_index,
-                            capture_method,
-                            stop_keys,
-                            stop_file,
-                            post_click_wait,
-                            action_name="legend_confirm",
-                            expected_labels={"card_reward", "dream_found"},
-                        )
-                    waiting_after_legend = False
-                    pending_legend_confirm_point = None
-                    last_action = now
-                    next_action_delay = DELAY_AFTER_LEGEND_CONFIRM
-                    continue
-                print_action(f"click matched legend option at {state.legend_choice.center}", CLICK_CHOICE_RIGHT, act)
-                if act:
-                    pending_legend_confirm_point = choice_confirm_point_for(state.legend_choice.center, frame.shape)
-                    click_frame_point(state.legend_choice.center, monitor)
-                    click_count += 1
-                    if sleep_interruptible(LEGEND_CONFIRM_DELAY, stop_keys, stop_file):
-                        return
-                    print_action(f"legend option confirm: click check at {pending_legend_confirm_point}", CLICK_CONFIRM, act)
-                    click_frame_point(pending_legend_confirm_point, monitor)
-                    click_count += 1
-                    wait_visual_change(
-                        detector,
-                        frame,
-                        monitor_index,
-                        capture_method,
-                        stop_keys,
-                        stop_file,
-                        post_click_wait,
-                        action_name="legend_confirm",
-                        expected_labels={"card_reward", "dream_found"},
-                    )
-                else:
-                    pending_legend_confirm_point = choice_confirm_point_for(state.legend_choice.center, frame.shape)
-                last_action = now
-                waiting_after_legend = False
-                pending_legend_confirm_point = None
-                next_action_delay = DELAY_AFTER_LEGEND_CONFIRM
-            elif state.choice_card:
-                dialog_advance_armed = False
-                wait_for_dialog_until = 0.0
-                waiting_after_legend = False
-                pending_legend_confirm_point = None
-                waiting_after_reward_action = False
-                handled_start_screen = False
-                if handled_choice_without_legend:
-                    print("choice screen without legend already handled once; waiting for screen to change.")
-                    last_action = now
-                    next_action_delay = DELAY_CHOICE_ALREADY_HANDLED
-                    if sleep_interruptible(interval, stop_keys, stop_file):
-                        return
-                    continue
-                click_count += fast_abandon_no_legend(
-                    detector,
-                    frame,
-                    monitor,
-                    monitor_index,
-                    capture_method,
-                    stop_keys,
-                    stop_file,
-                    act,
-                )
-                handled_choice_without_legend = True
-                last_action = now
-                next_action_delay = DELAY_AFTER_NO_LEGEND_CHAIN
-            elif state.flee_button:
-                dialog_advance_armed = False
-                wait_for_dialog_until = 0.0
-                waiting_after_legend = False
-                pending_legend_confirm_point = None
-                waiting_after_reward_action = False
-                handled_choice_without_legend = False
-                handled_start_screen = False
-                flee_point = state.flee_button.point_at(0.72, 0.50)
-                print_action(f"flee screen: click flee text area at {flee_point}", CLICK_ADVANCE, act)
-                if act:
-                    click_frame_point(flee_point, monitor)
-                    click_count += 1
-                    wait_visual_change(
-                        detector,
-                        frame,
-                        monitor_index,
-                        capture_method,
-                        stop_keys,
-                        stop_file,
-                        post_click_wait,
-                        action_name="flee",
-                        expected_labels={"return_confirm", "unknown"},
-                    )
-                last_action = now
-                next_action_delay = DELAY_AFTER_FLEE
-            elif state.team_enter:
-                waiting_after_legend = False
-                pending_legend_confirm_point = None
-                waiting_after_reward_action = False
-                handled_choice_without_legend = False
-                handled_start_screen = False
-                print_action(f"team screen: click enter at {state.team_enter.center}", CLICK_START_ENTER, act)
-                if act:
-                    click_frame_point(state.team_enter.center, monitor)
-                    click_count += 1
-                wait_for_dialog_until = time.time() + wait_after_team_enter
-                dialog_advance_armed = True
-                print(f"team enter clicked; dialog advance armed after {wait_after_team_enter:.1f}s.")
-                last_action = now
-                next_action_delay = min(max(wait_after_team_enter, interval), 1.0)
-            elif state.start_screen:
-                dialog_advance_armed = False
-                wait_for_dialog_until = 0.0
-                waiting_after_legend = False
-                pending_legend_confirm_point = None
-                waiting_after_reward_action = False
-                handled_choice_without_legend = False
-                if handled_start_screen:
-                    print("start screen already clicked once; waiting for screen to change.")
-                    last_action = now
-                    next_action_delay = DELAY_START_ALREADY_HANDLED
-                    if sleep_interruptible(interval, stop_keys, stop_file):
-                        return
-                    continue
-                click_point = state.start_screen.center
-                if fast_start_to_team_enabled:
-                    click_count += fast_start_to_team(
-                        monitor,
-                        stop_keys,
-                        stop_file,
-                        act,
-                        first_point=click_point,
-                    )
-                else:
-                    print_action(f"start screen: click enter at {click_point}", CLICK_START_ENTER, act)
-                    if act:
-                        click_frame_point(click_point, monitor)
-                        click_count += 1
-                        wait_visual_change(
-                            detector,
-                            frame,
-                            monitor_index,
-                            capture_method,
-                            stop_keys,
-                            stop_file,
-                            post_click_wait,
-                            action_name="start_enter",
-                            expected_labels={"team_screen", "unknown"},
-                        )
-                handled_start_screen = True
-                last_action = now
-                next_action_delay = DELAY_AFTER_START_ENTER
-            else:
-                waiting_after_legend = False
-                pending_legend_confirm_point = None
-                waiting_after_reward_action = False
-                handled_choice_without_legend = False
-                handled_start_screen = False
-                if advance_on_unknown:
-                    if not dialog_advance_armed:
-                        print("unknown screen: dialog advance is not armed; waiting for a team enter first.")
-                        last_action = now
-                        next_action_delay = DELAY_UNKNOWN_IDLE
-                        if sleep_interruptible(interval, stop_keys, stop_file):
-                            return
-                        continue
-                    if wait_for_dialog_until > now:
-                        remaining = wait_for_dialog_until - now
-                        print(f"unknown screen: waiting {remaining:.1f}s before dialog advance burst.")
-                        last_action = now
-                        next_action_delay = min(max(remaining, interval), 1.0)
-                        if sleep_interruptible(interval, stop_keys, stop_file):
-                            return
-                        continue
-                    wait_for_dialog_until = 0.0
-                    click_count += fast_advance_unknown(
-                        detector,
-                        monitor,
-                        monitor_index,
-                        capture_method,
-                        stop_keys,
-                        stop_file,
-                        act,
-                    )
-                    dialog_advance_armed = False
-                    last_action = now
-                    next_action_delay = DELAY_AFTER_UNKNOWN_BURST
-                else:
-                    print("unknown screen: no click. Pass --advance-on-unknown to enable blind advance clicks.")
-                    last_action = now
-                    next_action_delay = DELAY_UNKNOWN_IDLE
-        if sleep_interruptible(interval, stop_keys, stop_file):
-            return
+    LiveSession(
+        LiveConfig(
+            detector=detector,
+            act=act,
+            interval=interval,
+            no_dream_action=no_dream_action,
+            max_seconds=max_seconds,
+            monitor_index=monitor_index,
+            advance_on_unknown=advance_on_unknown,
+            stop_keys=stop_keys,
+            max_clicks=max_clicks,
+            stop_file=stop_file,
+            post_click_wait=post_click_wait,
+            capture_method=capture_method,
+            fast_start_to_team_enabled=fast_start_to_team_enabled,
+            log_interval=log_interval,
+            wait_after_team_enter=wait_after_team_enter,
+        )
+    ).run()
 
 
 def print_action(label: str, point: tuple[float, float], act: bool) -> None:
