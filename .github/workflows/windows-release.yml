@@ -1,0 +1,51 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Build portable app
+        run: |
+          python -m PyInstaller --clean --noconfirm czn_auto.spec
+          Copy-Item -Path run_min_loop_exe.bat -Destination dist\CZNAuto\run_min_loop.bat -Force
+          Copy-Item -Path run_one_click_exe.bat -Destination dist\CZNAuto\run_one_click.bat -Force
+          Copy-Item -Path stop_czn_auto_exe.bat -Destination dist\CZNAuto\stop_czn_auto.bat -Force
+          Compress-Archive -Path dist\CZNAuto\* -DestinationPath dist\CZNAuto-portable.zip -Force
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        run: iscc installer\czn_auto.iss
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CZNAuto-portable
+          path: dist/CZNAuto-portable.zip
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CZNAuto-installer
+          path: dist/installer/*.exe

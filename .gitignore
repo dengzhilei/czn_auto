@@ -8,5 +8,8 @@ out_*/
 out_video*/
 
 STOP
+build/
+dist/
+.venv-build/
 .venv/
 venv/

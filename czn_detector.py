@@ -4,6 +4,7 @@ import argparse
 import atexit
 import dataclasses
 import ctypes
+import sys
 import time
 from pathlib import Path
 from typing import Iterable
@@ -17,6 +18,12 @@ BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
 _DXGI_CAMERAS: dict[int, object] = {}
+
+
+def app_base_dir() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
 
 
 def set_dpi_awareness() -> None:
@@ -239,7 +246,7 @@ VK_CODES = {
 
 class CznDetector:
     def __init__(self, template_dir: Path | None = None, wide_match_scales: bool = False) -> None:
-        root = Path(__file__).resolve().parent
+        root = app_base_dir()
         self.template_dir = template_dir or root / "templates"
         self.match_scale_factors = WIDE_MATCH_SCALE_FACTORS if wide_match_scales else FAST_MATCH_SCALE_FACTORS
         self._warned_aspect_sizes: set[tuple[int, int]] = set()
@@ -658,7 +665,7 @@ def wait_visual_change(
     before_state = detector.detect(before_frame)
     after_path: Path | None = None
     if SAVE_VISUAL_CHANGE_DEBUG:
-        debug_dir = Path(__file__).resolve().parent / "debug_live"
+        debug_dir = Path.cwd() / "debug_live"
         stamp = time.strftime("%H%M%S")
         before_path = debug_dir / f"{stamp}_{action_name}_before.jpg"
         after_path = debug_dir / f"{stamp}_{action_name}_after.jpg"
@@ -1410,7 +1417,7 @@ def main() -> None:
         default="f8,esc,pause,end",
         help="Comma-separated global emergency stop keys for live mode.",
     )
-    parser.add_argument("--stop-file", type=Path, default=Path("czn_auto/STOP"), help="Create this file to stop live mode.")
+    parser.add_argument("--stop-file", type=Path, default=Path("STOP"), help="Create this file to stop live mode.")
     parser.add_argument(
         "--no-dream-action",
         choices=["retry-top-right", "confirm", "none"],

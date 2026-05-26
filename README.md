@@ -130,3 +130,33 @@ WAIT_AFTER_TEAM_ENTER_BEFORE_DIALOG = 4.0
 Set it higher in `czn_detector.py` if the loading/entry animation is still being clicked, or set it to `0` to disable this cooldown.
 
 Debug screenshots are off by default to avoid filling the repository with large runtime captures. Set `SAVE_VISUAL_CHANGE_DEBUG = True` in `czn_detector.py` only when diagnosing a transition.
+
+## Windows Release Build
+
+Build a portable Windows app that does not require Python on the target machine:
+
+```text
+build_release.bat
+```
+
+The portable build is written to:
+
+```text
+dist\CZNAuto
+```
+
+If Inno Setup is installed and `ISCC.exe` is on `PATH`, the same script also creates an installer under:
+
+```text
+dist\installer
+```
+
+GitHub Actions also has a manual `Windows Release` workflow that builds the portable zip and installer artifacts on Windows.
+
+Published users should run:
+
+```text
+run_min_loop.bat
+```
+
+or use the installed Start Menu shortcut. `CZNAuto.exe` itself is a console program and expects command-line arguments; the bat files and installer shortcuts provide the usual live-mode arguments.
