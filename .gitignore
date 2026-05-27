@@ -9,6 +9,7 @@ out_video*/
 logs/
 
 STOP
+config.json
 build/
 dist/
 .venv-build/

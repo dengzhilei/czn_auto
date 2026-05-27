@@ -15,6 +15,12 @@ python -m PyInstaller --clean --noconfirm czn_auto.spec
 copy /y run_min_loop_exe.bat dist\CZNAuto\run_min_loop.bat >nul
 copy /y run_one_click_exe.bat dist\CZNAuto\run_one_click.bat >nul
 copy /y stop_czn_auto_exe.bat dist\CZNAuto\stop_czn_auto.bat >nul
+copy /y open_config_exe.bat dist\CZNAuto\open_config.bat >nul
+copy /y config.example.json dist\CZNAuto\config.example.json >nul
+copy /y config.example.json dist\CZNAuto\config.json >nul
+copy /y CONFIG.md dist\CZNAuto\CONFIG.md >nul
+copy /y README.md dist\CZNAuto\README.md >nul
+xcopy /e /i /y templates dist\CZNAuto\templates >nul
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\CZNAuto\*' -DestinationPath 'dist\CZNAuto-portable.zip' -Force"
 
 set "ISCC_EXE="

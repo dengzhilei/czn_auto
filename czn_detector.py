@@ -89,11 +89,25 @@ def app_base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def app_install_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def default_log_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA")
     if base:
         return Path(base) / "CZN Auto" / "logs"
     return Path.home() / "AppData" / "Local" / "CZN Auto" / "logs"
+
+
+def default_config_dir() -> Path:
+    return app_install_dir()
+
+
+def default_config_file() -> Path:
+    return default_config_dir() / "config.json"
 
 
 def default_log_file() -> Path:
@@ -155,13 +169,16 @@ def print_run_header(args: argparse.Namespace, log_path: Path | None) -> None:
     print(f"log_file={log_path if log_path else 'disabled/unavailable'}")
     print(f"cwd={Path.cwd()}")
     print(f"app_base={app_base_dir()}")
+    print(f"app_install_dir={app_install_dir()}")
     print(f"frozen={bool(getattr(sys, 'frozen', False))}")
     print(f"python={sys.version.split()[0]} executable={sys.executable}")
     print(f"platform={platform.platform()}")
     print(f"argv={sys.argv!r}")
     print(f"args={json_safe_args(args)}")
+    print(f"config_messages={json.dumps(CONFIG_MESSAGES, ensure_ascii=False)}")
     print(f"display_environment={json.dumps(display_environment(), ensure_ascii=False, sort_keys=True)}")
     print(f"runtime_defaults={json.dumps(runtime_timing_profile(), ensure_ascii=False, sort_keys=True)}")
+    print(f"click_defaults={json.dumps(runtime_click_profile(), ensure_ascii=False, sort_keys=True)}")
     print("=" * 80)
 
 
@@ -212,8 +229,47 @@ def runtime_timing_profile() -> dict:
         "chain_flee_to_confirm_delay": CHAIN_FLEE_TO_CONFIRM_DELAY,
         "chain_menu_to_flee_timeout": CHAIN_MENU_TO_FLEE_TIMEOUT,
         "chain_flee_to_confirm_timeout": CHAIN_FLEE_TO_CONFIRM_TIMEOUT,
+        "chain_after_confirm_delay": CHAIN_AFTER_CONFIRM_DELAY,
+        "legend_confirm_delay": LEGEND_CONFIRM_DELAY,
+        "fast_click_duration": FAST_CLICK_DURATION,
+        "chain_click_duration": CHAIN_CLICK_DURATION,
+        "click_move_delay": CLICK_MOVE_DELAY,
+        "click_absolute_move_delay": CLICK_ABSOLUTE_MOVE_DELAY,
+        "click_after_up_delay": CLICK_AFTER_UP_DELAY,
+        "focus_top_delay": FOCUS_TOP_DELAY,
+        "focus_foreground_delay": FOCUS_FOREGROUND_DELAY,
+        "focus_retry_delay": FOCUS_RETRY_DELAY,
         "visual_change_poll_interval": VISUAL_CHANGE_POLL_INTERVAL,
+        "delay_reward_already_handled": DELAY_REWARD_ALREADY_HANDLED,
+        "delay_after_reward_action": DELAY_AFTER_REWARD_ACTION,
+        "delay_after_return_confirm": DELAY_AFTER_RETURN_CONFIRM,
+        "delay_after_no_legend_chain": DELAY_AFTER_NO_LEGEND_CHAIN,
+        "delay_choice_already_handled": DELAY_CHOICE_ALREADY_HANDLED,
+        "delay_after_flee": DELAY_AFTER_FLEE,
+        "delay_after_team_enter": DELAY_AFTER_TEAM_ENTER,
+        "delay_start_already_handled": DELAY_START_ALREADY_HANDLED,
+        "delay_after_start_enter": DELAY_AFTER_START_ENTER,
+        "delay_after_unknown_burst": DELAY_AFTER_UNKNOWN_BURST,
+        "delay_unknown_idle": DELAY_UNKNOWN_IDLE,
+        "delay_after_legend_confirm": DELAY_AFTER_LEGEND_CONFIRM,
         "click_window_log": LOG_CLICK_WINDOW,
+    }
+
+
+def runtime_click_profile() -> dict:
+    return {
+        "advance": CLICK_ADVANCE,
+        "choice_right": CLICK_CHOICE_RIGHT,
+        "confirm": CLICK_CONFIRM,
+        "retry_top_right": CLICK_RETRY_TOP_RIGHT,
+        "start_enter": CLICK_START_ENTER,
+        "team_enter": CLICK_TEAM_ENTER,
+        "button_text_point": BUTTON_TEXT_POINT,
+        "chain_flee": CHAIN_FLEE_POINT,
+        "chain_return_confirm": CHAIN_RETURN_CONFIRM_POINT,
+        "choice_confirm_y": CHOICE_CONFIRM_Y,
+        "team_fallback_match_max_x": TEAM_FALLBACK_MATCH_MAX_X,
+        "team_fallback_match_min_y": TEAM_FALLBACK_MATCH_MIN_Y,
     }
 
 
@@ -342,7 +398,10 @@ CLICK_CHOICE_RIGHT = (0.765, 0.860)
 CLICK_CONFIRM = (0.895, 0.945)
 CLICK_RETRY_TOP_RIGHT = (0.955, 0.055)
 CLICK_START_ENTER = (0.840, 0.905)
+CLICK_TEAM_ENTER = (0.840, 0.905)
 BUTTON_TEXT_POINT = (0.78, 0.52)
+TEAM_FALLBACK_MATCH_MAX_X = 0.86
+TEAM_FALLBACK_MATCH_MIN_Y = 0.90
 CHOICE_CONFIRM_Y = 0.946
 
 # ===== 可调速度参数 =====
@@ -444,6 +503,230 @@ DELAY_AFTER_UNKNOWN_BURST = 0.05
 DELAY_UNKNOWN_IDLE = 0.30
 DELAY_AFTER_LEGEND_CONFIRM = 1
 
+
+CONFIG_MESSAGES: list[str] = []
+CONFIG_BINDINGS = {
+    "click_points": {
+        "advance": ("CLICK_ADVANCE", "point"),
+        "choice_right": ("CLICK_CHOICE_RIGHT", "point"),
+        "confirm": ("CLICK_CONFIRM", "point"),
+        "retry_top_right": ("CLICK_RETRY_TOP_RIGHT", "point"),
+        "start_enter": ("CLICK_START_ENTER", "point"),
+        "team_enter": ("CLICK_TEAM_ENTER", "point"),
+        "button_text_point": ("BUTTON_TEXT_POINT", "point"),
+        "chain_flee": ("CHAIN_FLEE_POINT", "point"),
+        "chain_return_confirm": ("CHAIN_RETURN_CONFIRM_POINT", "point"),
+        "choice_confirm_y": ("CHOICE_CONFIRM_Y", "unit_float"),
+        "team_fallback_match_max_x": ("TEAM_FALLBACK_MATCH_MAX_X", "unit_float"),
+        "team_fallback_match_min_y": ("TEAM_FALLBACK_MATCH_MIN_Y", "unit_float"),
+    },
+    "timing": {
+        "live_loop_interval": ("LIVE_LOOP_INTERVAL", "positive_float"),
+        "live_log_interval": ("LIVE_LOG_INTERVAL", "nonnegative_float"),
+        "post_click_wait": ("POST_CLICK_WAIT", "nonnegative_float"),
+        "wait_after_team_enter": ("WAIT_AFTER_TEAM_ENTER_BEFORE_DIALOG", "nonnegative_float"),
+        "reward_settle_before_action": ("REWARD_SETTLE_BEFORE_ACTION", "nonnegative_float"),
+        "start_to_team_burst_taps": ("START_TO_TEAM_BURST_TAPS", "nonnegative_int"),
+        "start_to_team_tap_delay": ("START_TO_TEAM_TAP_DELAY", "nonnegative_float"),
+        "dialog_burst_max_taps": ("DIALOG_BURST_MAX_TAPS", "nonnegative_int"),
+        "dialog_burst_tap_delay": ("DIALOG_BURST_TAP_DELAY", "nonnegative_float"),
+        "dialog_burst_mode": ("DIALOG_BURST_MODE", "dialog_mode"),
+        "dialog_burst_rapid_postcheck": ("DIALOG_BURST_RAPID_POSTCHECK", "nonnegative_float"),
+        "dialog_burst_fallback_taps": ("DIALOG_BURST_FALLBACK_TAPS", "nonnegative_int"),
+        "dialog_burst_fallback_tap_delay": ("DIALOG_BURST_FALLBACK_TAP_DELAY", "nonnegative_float"),
+        "legend_dialog_taps": ("LEGEND_DIALOG_TAPS", "nonnegative_int"),
+        "legend_dialog_tap_delay": ("LEGEND_DIALOG_TAP_DELAY", "nonnegative_float"),
+        "legend_confirm_delay": ("LEGEND_CONFIRM_DELAY", "nonnegative_float"),
+        "chain_menu_to_flee_delay": ("CHAIN_MENU_TO_FLEE_DELAY", "nonnegative_float"),
+        "chain_flee_to_confirm_delay": ("CHAIN_FLEE_TO_CONFIRM_DELAY", "nonnegative_float"),
+        "chain_menu_to_flee_timeout": ("CHAIN_MENU_TO_FLEE_TIMEOUT", "nonnegative_float"),
+        "chain_flee_to_confirm_timeout": ("CHAIN_FLEE_TO_CONFIRM_TIMEOUT", "nonnegative_float"),
+        "chain_after_confirm_delay": ("CHAIN_AFTER_CONFIRM_DELAY", "nonnegative_float"),
+        "fast_click_duration": ("FAST_CLICK_DURATION", "nonnegative_float"),
+        "chain_click_duration": ("CHAIN_CLICK_DURATION", "nonnegative_float"),
+        "click_move_delay": ("CLICK_MOVE_DELAY", "nonnegative_float"),
+        "click_absolute_move_delay": ("CLICK_ABSOLUTE_MOVE_DELAY", "nonnegative_float"),
+        "click_after_up_delay": ("CLICK_AFTER_UP_DELAY", "nonnegative_float"),
+        "focus_top_delay": ("FOCUS_TOP_DELAY", "nonnegative_float"),
+        "focus_foreground_delay": ("FOCUS_FOREGROUND_DELAY", "nonnegative_float"),
+        "focus_retry_delay": ("FOCUS_RETRY_DELAY", "nonnegative_float"),
+        "visual_change_poll_interval": ("VISUAL_CHANGE_POLL_INTERVAL", "nonnegative_float"),
+        "delay_reward_already_handled": ("DELAY_REWARD_ALREADY_HANDLED", "nonnegative_float"),
+        "delay_after_reward_action": ("DELAY_AFTER_REWARD_ACTION", "nonnegative_float"),
+        "delay_after_return_confirm": ("DELAY_AFTER_RETURN_CONFIRM", "nonnegative_float"),
+        "delay_after_no_legend_chain": ("DELAY_AFTER_NO_LEGEND_CHAIN", "nonnegative_float"),
+        "delay_choice_already_handled": ("DELAY_CHOICE_ALREADY_HANDLED", "nonnegative_float"),
+        "delay_after_flee": ("DELAY_AFTER_FLEE", "nonnegative_float"),
+        "delay_after_team_enter": ("DELAY_AFTER_TEAM_ENTER", "nonnegative_float"),
+        "delay_start_already_handled": ("DELAY_START_ALREADY_HANDLED", "nonnegative_float"),
+        "delay_after_start_enter": ("DELAY_AFTER_START_ENTER", "nonnegative_float"),
+        "delay_after_unknown_burst": ("DELAY_AFTER_UNKNOWN_BURST", "nonnegative_float"),
+        "delay_unknown_idle": ("DELAY_UNKNOWN_IDLE", "nonnegative_float"),
+        "delay_after_legend_confirm": ("DELAY_AFTER_LEGEND_CONFIRM", "nonnegative_float"),
+    },
+}
+
+
+def default_user_config() -> dict:
+    return {
+        "_说明": "坐标都是相对当前截图的比例，左上角是 [0, 0]，右下角是 [1, 1]。时间单位是秒。",
+        "_建议": "先只小幅调整一个值。改坏了可以删除本文件，程序会重新生成默认配置。",
+        "click_points": {
+            "_说明": "常用点击位置。一般只需要改 start_enter/team_enter/advance。",
+            "advance": list(CLICK_ADVANCE),
+            "choice_right": list(CLICK_CHOICE_RIGHT),
+            "confirm": list(CLICK_CONFIRM),
+            "retry_top_right": list(CLICK_RETRY_TOP_RIGHT),
+            "start_enter": list(CLICK_START_ENTER),
+            "team_enter": list(CLICK_TEAM_ENTER),
+            "button_text_point": list(BUTTON_TEXT_POINT),
+            "chain_flee": list(CHAIN_FLEE_POINT),
+            "chain_return_confirm": list(CHAIN_RETURN_CONFIRM_POINT),
+            "choice_confirm_y": CHOICE_CONFIRM_Y,
+            "team_fallback_match_max_x": TEAM_FALLBACK_MATCH_MAX_X,
+            "team_fallback_match_min_y": TEAM_FALLBACK_MATCH_MIN_Y,
+        },
+        "timing": {
+            "_说明": "流程等待和连点参数。机器慢就优先加 wait_after_team_enter、post_click_wait、reward_settle_before_action。",
+            "live_loop_interval": LIVE_LOOP_INTERVAL,
+            "live_log_interval": LIVE_LOG_INTERVAL,
+            "post_click_wait": POST_CLICK_WAIT,
+            "wait_after_team_enter": WAIT_AFTER_TEAM_ENTER_BEFORE_DIALOG,
+            "reward_settle_before_action": REWARD_SETTLE_BEFORE_ACTION,
+            "start_to_team_burst_taps": START_TO_TEAM_BURST_TAPS,
+            "start_to_team_tap_delay": START_TO_TEAM_TAP_DELAY,
+            "dialog_burst_max_taps": DIALOG_BURST_MAX_TAPS,
+            "dialog_burst_tap_delay": DIALOG_BURST_TAP_DELAY,
+            "dialog_burst_mode": DIALOG_BURST_MODE,
+            "dialog_burst_rapid_postcheck": DIALOG_BURST_RAPID_POSTCHECK,
+            "dialog_burst_fallback_taps": DIALOG_BURST_FALLBACK_TAPS,
+            "dialog_burst_fallback_tap_delay": DIALOG_BURST_FALLBACK_TAP_DELAY,
+            "legend_dialog_taps": LEGEND_DIALOG_TAPS,
+            "legend_dialog_tap_delay": LEGEND_DIALOG_TAP_DELAY,
+            "legend_confirm_delay": LEGEND_CONFIRM_DELAY,
+            "chain_menu_to_flee_delay": CHAIN_MENU_TO_FLEE_DELAY,
+            "chain_flee_to_confirm_delay": CHAIN_FLEE_TO_CONFIRM_DELAY,
+            "chain_menu_to_flee_timeout": CHAIN_MENU_TO_FLEE_TIMEOUT,
+            "chain_flee_to_confirm_timeout": CHAIN_FLEE_TO_CONFIRM_TIMEOUT,
+            "chain_after_confirm_delay": CHAIN_AFTER_CONFIRM_DELAY,
+            "fast_click_duration": FAST_CLICK_DURATION,
+            "chain_click_duration": CHAIN_CLICK_DURATION,
+            "click_move_delay": CLICK_MOVE_DELAY,
+            "click_absolute_move_delay": CLICK_ABSOLUTE_MOVE_DELAY,
+            "click_after_up_delay": CLICK_AFTER_UP_DELAY,
+            "focus_top_delay": FOCUS_TOP_DELAY,
+            "focus_foreground_delay": FOCUS_FOREGROUND_DELAY,
+            "focus_retry_delay": FOCUS_RETRY_DELAY,
+            "visual_change_poll_interval": VISUAL_CHANGE_POLL_INTERVAL,
+            "delay_reward_already_handled": DELAY_REWARD_ALREADY_HANDLED,
+            "delay_after_reward_action": DELAY_AFTER_REWARD_ACTION,
+            "delay_after_return_confirm": DELAY_AFTER_RETURN_CONFIRM,
+            "delay_after_no_legend_chain": DELAY_AFTER_NO_LEGEND_CHAIN,
+            "delay_choice_already_handled": DELAY_CHOICE_ALREADY_HANDLED,
+            "delay_after_flee": DELAY_AFTER_FLEE,
+            "delay_after_team_enter": DELAY_AFTER_TEAM_ENTER,
+            "delay_start_already_handled": DELAY_START_ALREADY_HANDLED,
+            "delay_after_start_enter": DELAY_AFTER_START_ENTER,
+            "delay_after_unknown_burst": DELAY_AFTER_UNKNOWN_BURST,
+            "delay_unknown_idle": DELAY_UNKNOWN_IDLE,
+            "delay_after_legend_confirm": DELAY_AFTER_LEGEND_CONFIRM,
+        },
+    }
+
+
+def write_default_config(path: Path, overwrite: bool = False) -> Path:
+    if path.exists() and not overwrite:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(default_user_config(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _coerce_config_value(value: object, kind: str, label: str) -> object:
+    if kind == "point":
+        if not isinstance(value, list | tuple) or len(value) != 2:
+            raise ValueError(f"{label} must be [x, y]")
+        x = float(value[0])
+        y = float(value[1])
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise ValueError(f"{label} point values must be between 0 and 1")
+        return (x, y)
+    if kind == "unit_float":
+        number = float(value)
+        if not 0.0 <= number <= 1.0:
+            raise ValueError(f"{label} must be between 0 and 1")
+        return number
+    if kind == "positive_float":
+        number = float(value)
+        if number <= 0:
+            raise ValueError(f"{label} must be greater than 0")
+        return number
+    if kind == "nonnegative_float":
+        number = float(value)
+        if number < 0:
+            raise ValueError(f"{label} must be >= 0")
+        return number
+    if kind == "nonnegative_int":
+        number = int(value)
+        if number < 0:
+            raise ValueError(f"{label} must be >= 0")
+        return number
+    if kind == "dialog_mode":
+        text = str(value)
+        if text not in {"rapid", "checked"}:
+            raise ValueError(f"{label} must be rapid or checked")
+        return text
+    raise ValueError(f"unknown config type {kind}")
+
+
+def apply_user_config(path: Path, create_missing: bool = True) -> None:
+    if create_missing and not path.exists():
+        try:
+            write_default_config(path)
+            CONFIG_MESSAGES.append(f"created default config: {path}")
+        except OSError as exc:
+            CONFIG_MESSAGES.append(f"warning: failed to create config {path}: {exc}")
+            return
+    if not path.exists():
+        CONFIG_MESSAGES.append(f"user config disabled or missing: {path}")
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        CONFIG_MESSAGES.append(f"warning: failed to read config {path}: {exc}")
+        return
+    if not isinstance(data, dict):
+        CONFIG_MESSAGES.append(f"warning: config root must be an object: {path}")
+        return
+
+    applied: list[str] = []
+    for section, bindings in CONFIG_BINDINGS.items():
+        section_data = data.get(section, {})
+        if section_data is None:
+            continue
+        if not isinstance(section_data, dict):
+            CONFIG_MESSAGES.append(f"warning: config section {section} must be an object")
+            continue
+        for key, value in section_data.items():
+            if key.startswith("_"):
+                continue
+            binding = bindings.get(key)
+            if not binding:
+                CONFIG_MESSAGES.append(f"warning: unknown config key ignored: {section}.{key}")
+                continue
+            global_name, kind = binding
+            try:
+                globals()[global_name] = _coerce_config_value(value, kind, f"{section}.{key}")
+            except Exception as exc:
+                CONFIG_MESSAGES.append(f"warning: invalid config value ignored: {section}.{key}: {exc}")
+                continue
+            applied.append(f"{section}.{key}")
+    CONFIG_MESSAGES.append(f"loaded config: {path} ({len(applied)} values applied)")
+
+
 VK_CODES = {
     "esc": 0x1B,
     "end": 0x23,
@@ -457,8 +740,9 @@ VK_CODES = {
 
 class CznDetector:
     def __init__(self, template_dir: Path | None = None, wide_match_scales: bool = False) -> None:
-        root = app_base_dir()
-        self.template_dir = template_dir or root / "templates"
+        visible_templates = app_install_dir() / "templates"
+        bundled_templates = app_base_dir() / "templates"
+        self.template_dir = template_dir or (visible_templates if visible_templates.exists() else bundled_templates)
         self.match_scale_factors = WIDE_MATCH_SCALE_FACTORS if wide_match_scales else FAST_MATCH_SCALE_FACTORS
         self._warned_aspect_sizes: set[tuple[int, int]] = set()
         self.legend_template = self._load_template("legend_word.jpg")
@@ -772,6 +1056,14 @@ def print_state(prefix: str, state: DetectionState) -> None:
         print(" | ".join(parts), flush=True)
     except OSError:
         pass
+
+
+def start_match_looks_like_team_fallback(state: DetectionState, frame_shape: tuple[int, ...]) -> bool:
+    if not state.start_screen:
+        return False
+    h, w = frame_shape[:2]
+    cx, cy = state.start_screen.center
+    return (cx / max(1, w)) <= TEAM_FALLBACK_MATCH_MAX_X and (cy / max(1, h)) >= TEAM_FALLBACK_MATCH_MIN_Y
 
 
 def _monitor_meta(monitor_index: int) -> dict:
@@ -1623,6 +1915,8 @@ class LiveSession:
             return self.handle_flee_screen(frame, monitor, state, now)
         if state.team_enter:
             return self.handle_team_enter(monitor, state, now)
+        if state.start_screen and start_match_looks_like_team_fallback(state, frame.shape):
+            return self.handle_team_enter_fallback(monitor, state, now)
         if state.start_screen:
             return self.handle_start_screen(frame, monitor, state, now)
         return self.handle_unknown(monitor, now)
@@ -1787,6 +2081,30 @@ class LiveSession:
         self.mark_action(now, min(max(cfg.wait_after_team_enter, cfg.interval), 1.0))
         return True
 
+    def handle_team_enter_fallback(self, monitor: dict, state: DetectionState, now: float) -> bool:
+        cfg = self.config
+        rt = self.runtime
+        self.reset_common(dialog=False)
+        print(
+            "start template matched the lower-left team row; treating this as team screen "
+            f"fallback. match={state.start_screen.center if state.start_screen else None}"
+        )
+        print_action("team screen fallback: click fixed enter", CLICK_TEAM_ENTER, cfg.act)
+        if cfg.act:
+            click_norm(CLICK_TEAM_ENTER, monitor, duration=FAST_CLICK_DURATION)
+            rt.click_count += 1
+            self.expect_transition(
+                "team_enter_fallback",
+                state.label,
+                {"unknown", "choice_screen", "legend_choice", "card_reward", "dream_found"},
+                max(cfg.wait_after_team_enter + 2.0, cfg.post_click_wait),
+            )
+        rt.wait_for_dialog_until = time.time() + cfg.wait_after_team_enter
+        rt.dialog_advance_armed = True
+        print(f"team fallback clicked; dialog advance armed after {cfg.wait_after_team_enter:.1f}s.")
+        self.mark_action(now, min(max(cfg.wait_after_team_enter, cfg.interval), 1.0))
+        return True
+
     def handle_start_screen(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
         cfg = self.config
         rt = self.runtime
@@ -1802,23 +2120,18 @@ class LiveSession:
                 cfg.stop_keys,
                 cfg.stop_file,
                 cfg.act,
-                first_point=click_point,
+                first_point=None,
             )
             rt.click_count += quick_clicks
             if cfg.act:
-                rt.wait_for_dialog_until = time.time() + cfg.wait_after_team_enter
-                rt.dialog_advance_armed = True
                 if quick_clicks > 0:
                     self.expect_transition(
-                        "start_to_team_quick_chain",
+                        "start_enter",
                         state.label,
-                        {"team_screen", "unknown", "choice_screen", "legend_choice", "card_reward", "dream_found"},
-                        max(
-                            cfg.wait_after_team_enter + START_TO_TEAM_BURST_TAPS * START_TO_TEAM_TAP_DELAY + 2.0,
-                            cfg.post_click_wait,
-                        ),
+                        {"team_screen", "unknown"},
+                        max(cfg.post_click_wait, 2.0),
                     )
-                print(f"start -> team quick chain armed dialog advance after {cfg.wait_after_team_enter:.1f}s.")
+                print("start enter clicked; waiting for team screen recognition.")
         else:
             print_action(f"start screen: click enter at {click_point}", CLICK_START_ENTER, cfg.act)
             if cfg.act:
@@ -1916,7 +2229,22 @@ def print_action(label: str, point: tuple[float, float], act: bool) -> None:
 
 
 def main() -> None:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=Path, default=default_config_file())
+    pre_parser.add_argument("--no-user-config", action="store_true")
+    pre_parser.add_argument("--init-config", action="store_true")
+    pre_args, _ = pre_parser.parse_known_args()
+    if pre_args.init_config:
+        path = write_default_config(pre_args.config, overwrite=False)
+        print(f"config ready: {path}")
+        return
+    if not pre_args.no_user_config and not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        apply_user_config(pre_args.config)
+
     parser = argparse.ArgumentParser(description="CZN visual detector and cautious automation helper.")
+    parser.add_argument("--config", type=Path, default=pre_args.config, help="User config JSON path. Defaults to config.json next to the program.")
+    parser.add_argument("--no-user-config", action="store_true", help="Ignore the user config file for this run.")
+    parser.add_argument("--init-config", action="store_true", help="Create the default user config file and exit.")
     parser.add_argument("--image", type=Path)
     parser.add_argument("--video", type=Path)
     parser.add_argument("--every-sec", type=float, default=0.25)
