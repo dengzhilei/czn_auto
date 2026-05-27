@@ -4,8 +4,12 @@ import argparse
 import atexit
 import dataclasses
 import ctypes
+import json
+import os
+import platform
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Iterable
 
@@ -18,12 +22,199 @@ BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
 _DXGI_CAMERAS: dict[int, object] = {}
+_RUN_LOG_HANDLE = None
+_RUN_LOG_STDOUT = None
+_RUN_LOG_STDERR = None
+_DEFAULT_UNRAISABLEHOOK = sys.unraisablehook
+
+
+class TeeStream:
+    def __init__(self, stream, log_file) -> None:
+        self.stream = stream
+        self.log_file = log_file
+
+    def write(self, data: str) -> int:
+        for target in (self.stream, self.log_file):
+            try:
+                target.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for target in (self.stream, self.log_file):
+            try:
+                target.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        try:
+            return self.stream.isatty()
+        except Exception:
+            return False
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self.stream, "encoding", "utf-8")
+
+    def __getattr__(self, name: str):
+        return getattr(self.stream, name)
+
+
+def install_unraisable_filter() -> None:
+    def hook(unraisable) -> None:
+        exc = unraisable.exc_value
+        obj = unraisable.object
+        obj_text = repr(obj)
+        if (
+            isinstance(exc, OSError)
+            and "access violation writing" in str(exc).lower()
+            and ("comtypes" in obj_text or "_compointer_base" in obj_text)
+        ):
+            print(
+                f"warning: suppressed known comtypes cleanup warning: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        _DEFAULT_UNRAISABLEHOOK(unraisable)
+
+    sys.unraisablehook = hook
 
 
 def app_base_dir() -> Path:
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS)
     return Path(__file__).resolve().parent
+
+
+def default_log_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base) / "CZN Auto" / "logs"
+    return Path.home() / "AppData" / "Local" / "CZN Auto" / "logs"
+
+
+def default_log_file() -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return default_log_dir() / f"czn_auto_{stamp}_{os.getpid()}.log"
+
+
+def _close_run_log() -> None:
+    global _RUN_LOG_HANDLE, _RUN_LOG_STDOUT, _RUN_LOG_STDERR
+    if _RUN_LOG_HANDLE is None:
+        return
+    try:
+        print(f"run log closed: {_RUN_LOG_HANDLE.name}", flush=True)
+    except Exception:
+        pass
+    try:
+        sys.stdout = _RUN_LOG_STDOUT or sys.stdout
+        sys.stderr = _RUN_LOG_STDERR or sys.stderr
+        _RUN_LOG_HANDLE.close()
+    except Exception:
+        pass
+    _RUN_LOG_HANDLE = None
+
+
+def setup_run_log(log_file: Path | None) -> Path | None:
+    global _RUN_LOG_HANDLE, _RUN_LOG_STDOUT, _RUN_LOG_STDERR
+    if _RUN_LOG_HANDLE is not None:
+        return Path(_RUN_LOG_HANDLE.name)
+
+    path = log_file or default_log_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _RUN_LOG_HANDLE = path.open("a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        print(f"warning: failed to open run log {path}: {exc}", file=sys.stderr, flush=True)
+        return None
+
+    _RUN_LOG_STDOUT = sys.stdout
+    _RUN_LOG_STDERR = sys.stderr
+    sys.stdout = TeeStream(sys.stdout, _RUN_LOG_HANDLE)
+    sys.stderr = TeeStream(sys.stderr, _RUN_LOG_HANDLE)
+    atexit.register(_close_run_log)
+    return path
+
+
+def json_safe_args(args: argparse.Namespace) -> str:
+    values = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            values[key] = str(value)
+        else:
+            values[key] = value
+    return json.dumps(values, ensure_ascii=False, sort_keys=True)
+
+
+def print_run_header(args: argparse.Namespace, log_path: Path | None) -> None:
+    print("=" * 80)
+    print(f"CZN Auto run started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"log_file={log_path if log_path else 'disabled/unavailable'}")
+    print(f"cwd={Path.cwd()}")
+    print(f"app_base={app_base_dir()}")
+    print(f"frozen={bool(getattr(sys, 'frozen', False))}")
+    print(f"python={sys.version.split()[0]} executable={sys.executable}")
+    print(f"platform={platform.platform()}")
+    print(f"argv={sys.argv!r}")
+    print(f"args={json_safe_args(args)}")
+    print(f"display_environment={json.dumps(display_environment(), ensure_ascii=False, sort_keys=True)}")
+    print(f"runtime_defaults={json.dumps(runtime_timing_profile(), ensure_ascii=False, sort_keys=True)}")
+    print("=" * 80)
+
+
+def display_environment() -> dict:
+    user32 = ctypes.windll.user32
+    info: dict[str, object] = {
+        "primary_width": user32.GetSystemMetrics(0),
+        "primary_height": user32.GetSystemMetrics(1),
+        "virtual_left": user32.GetSystemMetrics(76),
+        "virtual_top": user32.GetSystemMetrics(77),
+        "virtual_width": user32.GetSystemMetrics(78),
+        "virtual_height": user32.GetSystemMetrics(79),
+        "monitor_count": user32.GetSystemMetrics(80),
+    }
+    try:
+        info["system_dpi"] = user32.GetDpiForSystem()
+    except Exception:
+        pass
+    try:
+        import mss
+
+        mss_cls = getattr(mss, "MSS", None) or getattr(mss, "mss")
+        with mss_cls() as sct:
+            info["mss_monitors"] = [dict(monitor) for monitor in sct.monitors]
+    except Exception as exc:
+        info["mss_monitors_error"] = repr(exc)
+    return info
+
+
+def runtime_timing_profile() -> dict:
+    return {
+        "live_loop_interval": LIVE_LOOP_INTERVAL,
+        "live_log_interval": LIVE_LOG_INTERVAL,
+        "post_click_wait": POST_CLICK_WAIT,
+        "wait_after_team_enter": WAIT_AFTER_TEAM_ENTER_BEFORE_DIALOG,
+        "dialog_burst_max_taps": DIALOG_BURST_MAX_TAPS,
+        "dialog_burst_tap_delay": DIALOG_BURST_TAP_DELAY,
+        "dialog_burst_mode": DIALOG_BURST_MODE,
+        "dialog_burst_rapid_postcheck": DIALOG_BURST_RAPID_POSTCHECK,
+        "dialog_burst_fallback_taps": DIALOG_BURST_FALLBACK_TAPS,
+        "dialog_burst_fallback_tap_delay": DIALOG_BURST_FALLBACK_TAP_DELAY,
+        "legend_dialog_taps": LEGEND_DIALOG_TAPS,
+        "legend_dialog_tap_delay": LEGEND_DIALOG_TAP_DELAY,
+        "start_to_team_burst_taps": START_TO_TEAM_BURST_TAPS,
+        "start_to_team_tap_delay": START_TO_TEAM_TAP_DELAY,
+        "reward_settle_before_action": REWARD_SETTLE_BEFORE_ACTION,
+        "chain_menu_to_flee_delay": CHAIN_MENU_TO_FLEE_DELAY,
+        "chain_flee_to_confirm_delay": CHAIN_FLEE_TO_CONFIRM_DELAY,
+        "chain_menu_to_flee_timeout": CHAIN_MENU_TO_FLEE_TIMEOUT,
+        "chain_flee_to_confirm_timeout": CHAIN_FLEE_TO_CONFIRM_TIMEOUT,
+        "visual_change_poll_interval": VISUAL_CHANGE_POLL_INTERVAL,
+        "click_window_log": LOG_CLICK_WINDOW,
+    }
 
 
 def set_dpi_awareness() -> None:
@@ -39,6 +230,7 @@ def set_dpi_awareness() -> None:
 
 
 set_dpi_awareness()
+install_unraisable_filter()
 
 
 def _stop_dxgi_cameras() -> None:
@@ -174,6 +366,8 @@ CHAIN_RETURN_CONFIRM_POINT = (0.691, 0.652)
 # 如果漏点，优先稍微加大这两个值；如果稳定，可以继续降低。
 CHAIN_MENU_TO_FLEE_DELAY = 0.3
 CHAIN_FLEE_TO_CONFIRM_DELAY = 0.2
+CHAIN_MENU_TO_FLEE_TIMEOUT = 1.8
+CHAIN_FLEE_TO_CONFIRM_TIMEOUT = 1.8
 
 # 点确认后给页面开始跳转的一点时间；后续仍由主循环识别当前位置。
 CHAIN_AFTER_CONFIRM_DELAY = 0.20
@@ -183,10 +377,26 @@ DIALOG_BURST_MAX_TAPS = 9
 
 # 对白页连续点击：每次点击后的间隔。想更快可以先试 0.08，再低要观察是否漏点。
 DIALOG_BURST_TAP_DELAY = 0.4
+DIALOG_BURST_MODE = "rapid"
+DIALOG_BURST_RAPID_POSTCHECK = 1.0
+DIALOG_BURST_FALLBACK_TAPS = 3
+DIALOG_BURST_FALLBACK_TAP_DELAY = 0.6
+LEGEND_DIALOG_TAPS = 2
+LEGEND_DIALOG_TAP_DELAY = 0.4
+DIALOG_BURST_STOP_LABELS = {
+    "dream_found",
+    "card_reward",
+    "legend_choice",
+    "choice_screen",
+    "flee_screen",
+    "return_confirm",
+    "team_screen",
+    "start_screen",
+}
 
-# Start-screen quick chain: after the main enter button is seen once,
-# keep tapping the known enter area briefly instead of waiting for team-screen recognition.
-START_TO_TEAM_BURST_TAPS = 2
+# Start-screen click count. Keep this at 1 so the team screen is recognized
+# before clicking the team enter button.
+START_TO_TEAM_BURST_TAPS = 1
 START_TO_TEAM_TAP_DELAY = 0.5
 WAIT_AFTER_TEAM_ENTER_BEFORE_DIALOG = 7.0
 POST_CLICK_WAIT = 4.0
@@ -567,7 +777,8 @@ def print_state(prefix: str, state: DetectionState) -> None:
 def _monitor_meta(monitor_index: int) -> dict:
     import mss
 
-    with mss.mss() as sct:
+    mss_cls = getattr(mss, "MSS", None) or getattr(mss, "mss")
+    with mss_cls() as sct:
         if monitor_index < 0 or monitor_index >= len(sct.monitors):
             raise ValueError(f"monitor index {monitor_index} is out of range; available: 0..{len(sct.monitors) - 1}")
         monitor = sct.monitors[monitor_index]
@@ -577,7 +788,8 @@ def _monitor_meta(monitor_index: int) -> dict:
 def _screen_shot_mss(monitor_index: int) -> tuple[np.ndarray, dict]:
     import mss
 
-    with mss.mss() as sct:
+    mss_cls = getattr(mss, "MSS", None) or getattr(mss, "mss")
+    with mss_cls() as sct:
         if monitor_index < 0 or monitor_index >= len(sct.monitors):
             raise ValueError(f"monitor index {monitor_index} is out of range; available: 0..{len(sct.monitors) - 1}")
         monitor = sct.monitors[monitor_index]
@@ -703,11 +915,51 @@ def wait_visual_change(
     if after_path:
         save_image(after_path, annotate(after_frame, after_state))
     saved = f", saved={after_path.name}" if after_path else ""
+    expected = f", expected={','.join(sorted(expected_labels))}" if expected_labels else ""
     print(
-        f"after click timeout/unexpected: state {before_state.label}->{after_state.label}, "
-        f"best_diff={best_score:.2f}, best_bottom_diff={best_roi_score:.2f}{saved}",
+        f"HIGH RISK: after click timeout/unexpected: state {before_state.label}->{after_state.label}, "
+        f"best_diff={best_score:.2f}, best_bottom_diff={best_roi_score:.2f}{expected}{saved}",
         flush=True,
     )
+
+
+def wait_for_detected_state(
+    detector: CznDetector,
+    monitor_index: int,
+    capture_method: str,
+    stop_keys: list[str],
+    stop_file: Path | None,
+    expected_labels: set[str],
+    timeout: float,
+    action_name: str,
+    *,
+    high_risk_on_timeout: bool = True,
+) -> tuple[np.ndarray, dict, DetectionState] | None:
+    deadline = time.time() + timeout
+    last_state: DetectionState | None = None
+    poll_count = 0
+    while time.time() < deadline:
+        if sleep_interruptible(VISUAL_CHANGE_POLL_INTERVAL, stop_keys, stop_file):
+            return None
+        frame, monitor = screen_shot(monitor_index, capture_method)
+        state = detector.detect(frame)
+        poll_count += 1
+        last_state = state
+        if state.label in expected_labels:
+            print(
+                f"fast wait ok: action={action_name}, state={state.label}, "
+                f"polls={poll_count}, elapsed={timeout - max(0.0, deadline - time.time()):.1f}s"
+            )
+            return frame, monitor, state
+
+    level = "HIGH RISK: " if high_risk_on_timeout else ""
+    current = last_state.label if last_state else "none"
+    expected = ",".join(sorted(expected_labels))
+    print(
+        f"{level}fast wait timeout: action={action_name}, current={current}, "
+        f"expected={expected}, timeout={timeout:.1f}s, polls={poll_count}"
+    )
+    return None
 
 
 def fast_advance_unknown(
@@ -720,12 +972,13 @@ def fast_advance_unknown(
     act: bool,
     max_taps: int = DIALOG_BURST_MAX_TAPS,
     tap_delay: float = DIALOG_BURST_TAP_DELAY,
+    mode: str = DIALOG_BURST_MODE,
 ) -> int:
     if stop_requested(stop_keys, stop_file):
         return 0
-    print_action(f"advance/continue burst x{max_taps}", CLICK_ADVANCE, act)
-    if act:
-        return rapid_click_norm(
+    print_action(f"advance/continue burst x{max_taps} mode={mode}", CLICK_ADVANCE, act)
+    if act and mode == "rapid":
+        clicks = rapid_click_norm(
             CLICK_ADVANCE,
             monitor,
             count=max_taps,
@@ -734,11 +987,90 @@ def fast_advance_unknown(
             stop_keys=stop_keys,
             stop_file=stop_file,
         )
+        waited = wait_for_detected_state(
+            detector,
+            monitor_index,
+            capture_method,
+            stop_keys,
+            stop_file,
+            DIALOG_BURST_STOP_LABELS,
+            max(DIALOG_BURST_RAPID_POSTCHECK, tap_delay * 2),
+            "dialog_burst_rapid_postcheck",
+            high_risk_on_timeout=True,
+        )
+        if waited:
+            _, _, state = waited
+            print(f"dialog rapid burst postcheck: reached {state.label} after {clicks} taps.")
+            return clicks
+        if stop_requested(stop_keys, stop_file):
+            print("dialog rapid burst postcheck stopped; skip fallback clicks.")
+            return clicks
+
+        print(
+            f"dialog rapid burst fallback: no next state after {clicks} rapid taps; "
+            f"switching to checked fallback x{DIALOG_BURST_FALLBACK_TAPS}."
+        )
+        clicks += checked_dialog_advance(
+            detector,
+            monitor,
+            monitor_index,
+            capture_method,
+            stop_keys,
+            stop_file,
+            act,
+            max_taps=DIALOG_BURST_FALLBACK_TAPS,
+            tap_delay=DIALOG_BURST_FALLBACK_TAP_DELAY,
+            prefix="dialog fallback",
+        )
+        return clicks
+
+    return checked_dialog_advance(
+        detector,
+        monitor,
+        monitor_index,
+        capture_method,
+        stop_keys,
+        stop_file,
+        act,
+        max_taps=max_taps,
+        tap_delay=tap_delay,
+        prefix="dialog burst",
+    )
+
+
+def checked_dialog_advance(
+    detector: CznDetector,
+    monitor: dict,
+    monitor_index: int,
+    capture_method: str,
+    stop_keys: list[str],
+    stop_file: Path | None,
+    act: bool,
+    max_taps: int,
+    tap_delay: float,
+    prefix: str,
+) -> int:
+    clicks = 0
     for i in range(max_taps):
-        print_action(f"advance/continue burst {i + 1}/{max_taps}", CLICK_ADVANCE, act)
+        print_action(f"{prefix} {i + 1}/{max_taps}", CLICK_ADVANCE, act)
+        if act:
+            click_norm(CLICK_ADVANCE, monitor, duration=FAST_CLICK_DURATION)
+            clicks += 1
         if sleep_interruptible(tap_delay, stop_keys, stop_file):
-            return 0
-    return 0
+            return clicks
+        if act:
+            frame, _ = screen_shot(monitor_index, capture_method)
+            state = detector.detect(frame)
+            print_state(f"{prefix} {i + 1}/{max_taps}", state)
+            if state.label in DIALOG_BURST_STOP_LABELS:
+                print(f"{prefix} stopped early: reached {state.label} after {clicks} taps.")
+                return clicks
+    if act:
+        print(
+            f"HIGH RISK: {prefix} exhausted: taps={clicks}, state still unknown or not recognized. "
+            "Possible causes: slow loading, stale screenshot, wrong monitor/resolution, or dialog timing mismatch."
+        )
+    return clicks
 
 
 def fast_start_to_team(
@@ -790,23 +1122,67 @@ def fast_abandon_no_legend(
             click_norm(CLICK_RETRY_TOP_RIGHT, monitor, duration=CHAIN_CLICK_DURATION)
         clicks += 1
 
-    if sleep_interruptible(CHAIN_MENU_TO_FLEE_DELAY, stop_keys, stop_file):
+    flee_state: DetectionState | None = None
+    flee_monitor = monitor
+    if act:
+        waited = wait_for_detected_state(
+            detector,
+            monitor_index,
+            capture_method,
+            stop_keys,
+            stop_file,
+            {"flee_screen"},
+            CHAIN_MENU_TO_FLEE_TIMEOUT,
+            "no_legend_menu_to_flee",
+        )
+        if waited:
+            _, flee_monitor, flee_state = waited
+    elif sleep_interruptible(CHAIN_MENU_TO_FLEE_DELAY, stop_keys, stop_file):
         return clicks
 
-    print_action("no legend chain: click fixed flee", CHAIN_FLEE_POINT, act)
     if act:
-        click_norm(CHAIN_FLEE_POINT, monitor, duration=CHAIN_CLICK_DURATION)
+        if flee_state and flee_state.flee_button:
+            flee_point = flee_state.flee_button.point_at(0.72, 0.50)
+            print_action(f"no legend chain: click detected flee at {flee_point}", CHAIN_FLEE_POINT, act)
+            click_frame_point(flee_point, flee_monitor, duration=CHAIN_CLICK_DURATION)
+        else:
+            print_action("no legend chain: click fixed flee fallback", CHAIN_FLEE_POINT, act)
+            click_norm(CHAIN_FLEE_POINT, monitor, duration=CHAIN_CLICK_DURATION)
         clicks += 1
+    else:
+        print_action("no legend chain: click fixed flee", CHAIN_FLEE_POINT, act)
 
-    if sleep_interruptible(CHAIN_FLEE_TO_CONFIRM_DELAY, stop_keys, stop_file):
+    confirm_state: DetectionState | None = None
+    confirm_monitor = monitor
+    if act:
+        waited = wait_for_detected_state(
+            detector,
+            monitor_index,
+            capture_method,
+            stop_keys,
+            stop_file,
+            {"return_confirm"},
+            CHAIN_FLEE_TO_CONFIRM_TIMEOUT,
+            "no_legend_flee_to_confirm",
+        )
+        if waited:
+            _, confirm_monitor, confirm_state = waited
+    elif sleep_interruptible(CHAIN_FLEE_TO_CONFIRM_DELAY, stop_keys, stop_file):
         return clicks
 
-    print_action("no legend chain: click fixed confirm", CHAIN_RETURN_CONFIRM_POINT, act)
     if act:
-        click_norm(CHAIN_RETURN_CONFIRM_POINT, monitor, duration=CHAIN_CLICK_DURATION)
+        if confirm_state and confirm_state.return_confirm:
+            confirm_point = confirm_state.return_confirm.point_at(0.68, 0.50)
+            print_action(f"no legend chain: click detected confirm at {confirm_point}", CHAIN_RETURN_CONFIRM_POINT, act)
+            click_frame_point(confirm_point, confirm_monitor, duration=CHAIN_CLICK_DURATION)
+        else:
+            print_action("no legend chain: click fixed confirm fallback", CHAIN_RETURN_CONFIRM_POINT, act)
+            click_norm(CHAIN_RETURN_CONFIRM_POINT, monitor, duration=CHAIN_CLICK_DURATION)
         clicks += 1
         if sleep_interruptible(CHAIN_AFTER_CONFIRM_DELAY, stop_keys, stop_file):
             return clicks
+    else:
+        print_action("no legend chain: click fixed confirm", CHAIN_RETURN_CONFIRM_POINT, act)
     return clicks
 
 
@@ -990,6 +1366,16 @@ class LiveConfig:
     fast_start_to_team_enabled: bool
     log_interval: float
     wait_after_team_enter: float
+    dialog_burst_mode: str
+
+
+@dataclasses.dataclass
+class ExpectedTransition:
+    action_name: str
+    from_label: str
+    expected_labels: set[str]
+    started: float
+    deadline: float
 
 
 @dataclasses.dataclass
@@ -1008,6 +1394,7 @@ class LiveRuntime:
     last_log_time: float = 0.0
     wait_for_dialog_until: float = 0.0
     dialog_advance_armed: bool = False
+    expected_transition: ExpectedTransition | None = None
 
 
 class LiveSession:
@@ -1021,24 +1408,42 @@ class LiveSession:
             f"live mode started. capture={cfg.capture_method}. Stop keys: {', '.join(k.upper() for k in cfg.stop_keys)}. "
             "Dry-run is ON unless --act is passed."
         )
+        print(
+            "live config: "
+            f"act={cfg.act}, interval={cfg.interval}, log_interval={cfg.log_interval}, "
+            f"monitor={cfg.monitor_index}, max_seconds={cfg.max_seconds}, max_clicks={cfg.max_clicks}, "
+            f"no_dream_action={cfg.no_dream_action}, advance_on_unknown={cfg.advance_on_unknown}, "
+            f"fast_start_to_team={cfg.fast_start_to_team_enabled}, post_click_wait={cfg.post_click_wait}, "
+            f"wait_after_team_enter={cfg.wait_after_team_enter}, dialog_burst_mode={cfg.dialog_burst_mode}, "
+            f"stop_file={cfg.stop_file}"
+        )
+        print(
+            f"detector: template_dir={cfg.detector.template_dir}, "
+            f"match_scale_factors={cfg.detector.match_scale_factors}"
+        )
         if cfg.stop_file and cfg.stop_file.exists():
             cfg.stop_file.unlink()
 
-        while True:
-            if self.should_stop():
-                return
-            frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method)
-            if not self.runtime.printed_monitor:
-                print(f"using monitor {cfg.monitor_index}: {monitor}")
-                self.runtime.printed_monitor = True
-            state = cfg.detector.detect(frame)
-            now = time.time()
-            self.log_state(now, state)
-            if now - self.runtime.last_action >= self.runtime.next_action_delay:
-                if not self.handle_state(frame, monitor, state, now):
+        try:
+            while True:
+                if self.should_stop():
                     return
-            if sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file):
-                return
+                frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method)
+                if not self.runtime.printed_monitor:
+                    print(f"using monitor {cfg.monitor_index}: {monitor}; frame_shape={frame.shape}")
+                    self.runtime.printed_monitor = True
+                state = cfg.detector.detect(frame)
+                now = time.time()
+                self.log_state(now, state)
+                self.check_expected_transition(now, state)
+                if now - self.runtime.last_action >= self.runtime.next_action_delay:
+                    if not self.handle_state(frame, monitor, state, now):
+                        return
+                if sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file):
+                    return
+        finally:
+            elapsed = time.time() - self.runtime.started
+            print(f"live mode stopped. elapsed={elapsed:.1f}s, clicks={self.runtime.click_count}")
 
     def should_stop(self) -> bool:
         cfg = self.config
@@ -1063,6 +1468,55 @@ class LiveSession:
     def mark_action(self, now: float, delay: float) -> None:
         self.runtime.last_action = now
         self.runtime.next_action_delay = delay
+
+    def expect_transition(
+        self,
+        action_name: str,
+        from_label: str,
+        expected_labels: set[str],
+        timeout: float,
+    ) -> None:
+        if not self.config.act:
+            return
+        started = time.time()
+        timeout = max(timeout, self.config.interval)
+        self.runtime.expected_transition = ExpectedTransition(
+            action_name=action_name,
+            from_label=from_label,
+            expected_labels=expected_labels,
+            started=started,
+            deadline=started + timeout,
+        )
+        expected = ",".join(sorted(expected_labels))
+        print(
+            f"watch transition: action={action_name}, from={from_label}, "
+            f"expected={expected}, timeout={timeout:.1f}s"
+        )
+
+    def check_expected_transition(self, now: float, state: DetectionState) -> None:
+        transition = self.runtime.expected_transition
+        if transition is None:
+            return
+        if state.label in transition.expected_labels:
+            elapsed = now - transition.started
+            print(
+                f"transition ok: action={transition.action_name}, "
+                f"{transition.from_label}->{state.label}, elapsed={elapsed:.1f}s"
+            )
+            self.runtime.expected_transition = None
+            return
+        if now < transition.deadline:
+            return
+
+        expected = ",".join(sorted(transition.expected_labels))
+        elapsed = now - transition.started
+        print(
+            "HIGH RISK: transition timeout: "
+            f"action={transition.action_name}, from={transition.from_label}, "
+            f"current={state.label}, expected={expected}, elapsed={elapsed:.1f}s. "
+            "Possible causes: click missed, wrong monitor/resolution, stale screenshot, or UI timing too short."
+        )
+        self.runtime.expected_transition = None
 
     def disarm_dialog(self) -> None:
         self.runtime.dialog_advance_armed = False
@@ -1108,6 +1562,51 @@ class LiveSession:
             action_name=action_name,
             expected_labels=expected_labels,
         )
+
+    def handle_after_legend_confirm(self, frame: np.ndarray, monitor: dict) -> None:
+        cfg = self.config
+        rt = self.runtime
+        if not cfg.act:
+            return
+
+        waited = wait_for_detected_state(
+            cfg.detector,
+            cfg.monitor_index,
+            cfg.capture_method,
+            cfg.stop_keys,
+            cfg.stop_file,
+            {"card_reward", "dream_found", "unknown"},
+            cfg.post_click_wait,
+            "legend_confirm_to_reward_or_dialog",
+        )
+        if not waited:
+            return
+
+        _, next_monitor, next_state = waited
+        if next_state.label in {"card_reward", "dream_found"}:
+            return
+
+        print("legend confirm reached unknown/dialog; advancing dialog before reward.")
+        dialog_clicks = checked_dialog_advance(
+            cfg.detector,
+            next_monitor or monitor,
+            cfg.monitor_index,
+            cfg.capture_method,
+            cfg.stop_keys,
+            cfg.stop_file,
+            cfg.act,
+            max_taps=LEGEND_DIALOG_TAPS,
+            tap_delay=LEGEND_DIALOG_TAP_DELAY,
+            prefix="legend dialog",
+        )
+        rt.click_count += dialog_clicks
+        if dialog_clicks > 0:
+            self.expect_transition(
+                "legend_dialog_advance",
+                "unknown",
+                {"card_reward", "dream_found", "choice_screen", "legend_choice"},
+                max(cfg.post_click_wait, LEGEND_DIALOG_TAPS * LEGEND_DIALOG_TAP_DELAY + 1.0),
+            )
 
     def handle_state(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
         if state.dream_card:
@@ -1201,7 +1700,7 @@ class LiveSession:
             if cfg.act:
                 click_frame_point(rt.pending_legend_confirm_point, monitor)
                 rt.click_count += 1
-                self.wait_visual(frame, "legend_confirm", {"card_reward", "dream_found"})
+                self.handle_after_legend_confirm(frame, monitor)
             rt.waiting_after_legend = False
             rt.pending_legend_confirm_point = None
             self.mark_action(now, DELAY_AFTER_LEGEND_CONFIRM)
@@ -1217,7 +1716,7 @@ class LiveSession:
             print_action(f"legend option confirm: click check at {rt.pending_legend_confirm_point}", CLICK_CONFIRM, cfg.act)
             click_frame_point(rt.pending_legend_confirm_point, monitor)
             rt.click_count += 1
-            self.wait_visual(frame, "legend_confirm", {"card_reward", "dream_found"})
+            self.handle_after_legend_confirm(frame, monitor)
         else:
             rt.pending_legend_confirm_point = choice_confirm_point_for(state.legend_choice.center, frame.shape)
         rt.waiting_after_legend = False
@@ -1233,7 +1732,7 @@ class LiveSession:
             print("choice screen without legend already handled once; waiting for screen to change.")
             self.mark_action(now, DELAY_CHOICE_ALREADY_HANDLED)
             return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
-        rt.click_count += fast_abandon_no_legend(
+        chain_clicks = fast_abandon_no_legend(
             cfg.detector,
             frame,
             monitor,
@@ -1243,6 +1742,14 @@ class LiveSession:
             cfg.stop_file,
             cfg.act,
         )
+        rt.click_count += chain_clicks
+        if chain_clicks > 0:
+            self.expect_transition(
+                "no_legend_chain",
+                "choice_screen",
+                {"return_confirm", "start_screen", "team_screen", "unknown"},
+                max(cfg.post_click_wait, CHAIN_MENU_TO_FLEE_TIMEOUT + CHAIN_FLEE_TO_CONFIRM_TIMEOUT + 1.0),
+            )
         rt.handled_choice_without_legend = True
         self.mark_action(now, DELAY_AFTER_NO_LEGEND_CHAIN)
         return True
@@ -1268,6 +1775,12 @@ class LiveSession:
         if cfg.act:
             click_frame_point(click_point, monitor)
             rt.click_count += 1
+            self.expect_transition(
+                "team_enter",
+                state.label,
+                {"unknown", "choice_screen", "legend_choice", "card_reward", "dream_found"},
+                max(cfg.wait_after_team_enter + 2.0, cfg.post_click_wait),
+            )
         rt.wait_for_dialog_until = time.time() + cfg.wait_after_team_enter
         rt.dialog_advance_armed = True
         print(f"team enter clicked; dialog advance armed after {cfg.wait_after_team_enter:.1f}s.")
@@ -1284,16 +1797,27 @@ class LiveSession:
             return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
         click_point = state.start_screen.point_at(*BUTTON_TEXT_POINT)
         if cfg.fast_start_to_team_enabled:
-            rt.click_count += fast_start_to_team(
+            quick_clicks = fast_start_to_team(
                 monitor,
                 cfg.stop_keys,
                 cfg.stop_file,
                 cfg.act,
                 first_point=click_point,
             )
+            rt.click_count += quick_clicks
             if cfg.act:
                 rt.wait_for_dialog_until = time.time() + cfg.wait_after_team_enter
                 rt.dialog_advance_armed = True
+                if quick_clicks > 0:
+                    self.expect_transition(
+                        "start_to_team_quick_chain",
+                        state.label,
+                        {"team_screen", "unknown", "choice_screen", "legend_choice", "card_reward", "dream_found"},
+                        max(
+                            cfg.wait_after_team_enter + START_TO_TEAM_BURST_TAPS * START_TO_TEAM_TAP_DELAY + 2.0,
+                            cfg.post_click_wait,
+                        ),
+                    )
                 print(f"start -> team quick chain armed dialog advance after {cfg.wait_after_team_enter:.1f}s.")
         else:
             print_action(f"start screen: click enter at {click_point}", CLICK_START_ENTER, cfg.act)
@@ -1323,7 +1847,7 @@ class LiveSession:
             self.mark_action(now, min(max(remaining, cfg.interval), 1.0))
             return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
         rt.wait_for_dialog_until = 0.0
-        rt.click_count += fast_advance_unknown(
+        burst_clicks = fast_advance_unknown(
             cfg.detector,
             monitor,
             cfg.monitor_index,
@@ -1332,6 +1856,14 @@ class LiveSession:
             cfg.stop_file,
             cfg.act,
         )
+        rt.click_count += burst_clicks
+        if burst_clicks > 0:
+            self.expect_transition(
+                "dialog_advance_burst",
+                "unknown",
+                {"choice_screen", "legend_choice", "card_reward", "dream_found", "flee_screen", "return_confirm"},
+                max(2.0, cfg.interval * 4),
+            )
         rt.dialog_advance_armed = False
         self.mark_action(now, DELAY_AFTER_UNKNOWN_BURST)
         return True
@@ -1353,6 +1885,7 @@ def run_live(
     fast_start_to_team_enabled: bool,
     log_interval: float,
     wait_after_team_enter: float,
+    dialog_burst_mode: str,
 ) -> None:
     stop_keys = parse_stop_keys(stop_key)
     LiveSession(
@@ -1372,6 +1905,7 @@ def run_live(
             fast_start_to_team_enabled=fast_start_to_team_enabled,
             log_interval=log_interval,
             wait_after_team_enter=wait_after_team_enter,
+            dialog_burst_mode=dialog_burst_mode,
         )
     ).run()
 
@@ -1387,6 +1921,8 @@ def main() -> None:
     parser.add_argument("--video", type=Path)
     parser.add_argument("--every-sec", type=float, default=0.25)
     parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--log-file", type=Path, help="Write detailed run output to this log file. Defaults to LocalAppData\\CZN Auto\\logs.")
+    parser.add_argument("--no-run-log", action="store_true", help="Disable the automatic per-run log file.")
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--act", action="store_true", help="Actually click in live mode. Omit for dry-run.")
     parser.add_argument("--interval", type=float, default=LIVE_LOOP_INTERVAL)
@@ -1399,6 +1935,12 @@ def main() -> None:
         type=float,
         default=WAIT_AFTER_TEAM_ENTER_BEFORE_DIALOG,
         help="After clicking team enter, wait this many seconds before allowing blind dialog advance bursts.",
+    )
+    parser.add_argument(
+        "--dialog-burst-mode",
+        choices=["rapid", "checked"],
+        default=DIALOG_BURST_MODE,
+        help="Dialog advance burst behavior. rapid keeps the old fast continuous clicks; checked re-detects after each tap.",
     )
     parser.add_argument("--monitor", type=int, default=1, help="monitor index. 1 is primary on this machine; 2 is the secondary display.")
     parser.add_argument(
@@ -1432,6 +1974,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    log_path = None
+    if not args.no_run_log:
+        log_path = setup_run_log(args.log_file)
+    print_run_header(args, log_path)
+
     detector = CznDetector(wide_match_scales=args.wide_match_scales)
     if args.image:
         run_image(detector, args.image, args.out_dir)
@@ -1454,10 +2001,19 @@ def main() -> None:
             args.fast_start_to_team,
             args.log_interval,
             args.wait_after_team_enter,
+            args.dialog_burst_mode,
         )
     else:
         parser.error("pass --image, --video, or --live")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt; exiting.", file=sys.stderr, flush=True)
+        raise SystemExit(130)
+    except Exception:
+        print("fatal error: unhandled exception", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        raise SystemExit(1)
