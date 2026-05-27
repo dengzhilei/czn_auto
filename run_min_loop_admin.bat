@@ -11,5 +11,5 @@ del .\STOP 2>nul
 echo Admin minimal loop on monitor 1.
 echo Stop keys: F8, ESC, PAUSE, END
 echo Emergency kill: run czn_auto\stop_czn_auto.bat
-python .\czn_auto\czn_detector.py --live --act --advance-on-unknown --fast-start-to-team
+python .\czn_auto\czn_detector.py --live --act --advance-on-unknown --fast-start-to-team --wide-match-scales
 pause

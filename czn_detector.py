@@ -150,6 +150,7 @@ CLICK_CHOICE_RIGHT = (0.765, 0.860)
 CLICK_CONFIRM = (0.895, 0.945)
 CLICK_RETRY_TOP_RIGHT = (0.955, 0.055)
 CLICK_START_ENTER = (0.840, 0.905)
+BUTTON_TEXT_POINT = (0.78, 0.52)
 CHOICE_CONFIRM_Y = 0.946
 
 # ===== 可调速度参数 =====
@@ -357,9 +358,9 @@ class CznDetector:
     def _detect_choice_anchors(self, frame_gray: np.ndarray) -> MatchResult | None:
         h, w = frame_gray.shape[:2]
         glow_rois = [
-            Box(0.20, 0.92, 0.31, 0.998),
-            Box(0.46, 0.92, 0.57, 0.998),
-            Box(0.72, 0.92, 0.83, 0.998),
+            Box(0.18, 0.84, 0.33, 0.998),
+            Box(0.44, 0.84, 0.59, 0.998),
+            Box(0.70, 0.84, 0.85, 0.998),
         ]
         matches: list[MatchResult] = []
         for index, roi in enumerate(glow_rois, start=1):
@@ -1262,9 +1263,10 @@ class LiveSession:
         cfg = self.config
         rt = self.runtime
         self.reset_common(dialog=False)
-        print_action(f"team screen: click enter at {state.team_enter.center}", CLICK_START_ENTER, cfg.act)
+        click_point = state.team_enter.point_at(*BUTTON_TEXT_POINT)
+        print_action(f"team screen: click enter at {click_point}", CLICK_START_ENTER, cfg.act)
         if cfg.act:
-            click_frame_point(state.team_enter.center, monitor)
+            click_frame_point(click_point, monitor)
             rt.click_count += 1
         rt.wait_for_dialog_until = time.time() + cfg.wait_after_team_enter
         rt.dialog_advance_armed = True
@@ -1280,7 +1282,7 @@ class LiveSession:
             print("start screen already clicked once; waiting for screen to change.")
             self.mark_action(now, DELAY_START_ALREADY_HANDLED)
             return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
-        click_point = state.start_screen.center
+        click_point = state.start_screen.point_at(*BUTTON_TEXT_POINT)
         if cfg.fast_start_to_team_enabled:
             rt.click_count += fast_start_to_team(
                 monitor,
@@ -1289,6 +1291,10 @@ class LiveSession:
                 cfg.act,
                 first_point=click_point,
             )
+            if cfg.act:
+                rt.wait_for_dialog_until = time.time() + cfg.wait_after_team_enter
+                rt.dialog_advance_armed = True
+                print(f"start -> team quick chain armed dialog advance after {cfg.wait_after_team_enter:.1f}s.")
         else:
             print_action(f"start screen: click enter at {click_point}", CLICK_START_ENTER, cfg.act)
             if cfg.act:
