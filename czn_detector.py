@@ -11,6 +11,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from ctypes import wintypes
 from typing import Iterable
 
 import cv2
@@ -26,6 +27,31 @@ _RUN_LOG_HANDLE = None
 _RUN_LOG_STDOUT = None
 _RUN_LOG_STDERR = None
 _DEFAULT_UNRAISABLEHOOK = sys.unraisablehook
+
+INPUT_BACKEND_SENDINPUT = "sendinput"
+INPUT_BACKEND_POSTMESSAGE = "postmessage"
+INPUT_BACKEND_POSTMESSAGE_ACTIVATE = "postmessage_activate"
+INPUT_BACKENDS = {
+    INPUT_BACKEND_SENDINPUT,
+    INPUT_BACKEND_POSTMESSAGE,
+    INPUT_BACKEND_POSTMESSAGE_ACTIVATE,
+}
+
+CAPTURE_METHOD_AUTO = "auto"
+CAPTURE_METHOD_DXGI = "dxgi"
+CAPTURE_METHOD_MSS = "mss"
+CAPTURE_METHODS = {
+    CAPTURE_METHOD_AUTO,
+    CAPTURE_METHOD_DXGI,
+    CAPTURE_METHOD_MSS,
+}
+
+WM_ACTIVATE = 0x0006
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WA_ACTIVE = 1
+MK_LBUTTON = 0x0001
 
 
 class TeeStream:
@@ -258,6 +284,9 @@ def runtime_timing_profile() -> dict:
 
 def runtime_click_profile() -> dict:
     return {
+        "input_backend": INPUT_BACKEND,
+        "restore_cursor_after_click": RESTORE_CURSOR_AFTER_CLICK,
+        "target_window_title": INPUT_TARGET_WINDOW_TITLE,
         "advance": CLICK_ADVANCE,
         "choice_right": CLICK_CHOICE_RIGHT,
         "confirm": CLICK_CONFIRM,
@@ -462,6 +491,10 @@ POST_CLICK_WAIT = 4.0
 REWARD_SETTLE_BEFORE_ACTION = 1.5
 SAVE_VISUAL_CHANGE_DEBUG = False
 LOG_CLICK_WINDOW = False
+INPUT_BACKEND = INPUT_BACKEND_POSTMESSAGE_ACTIVATE
+RESTORE_CURSOR_AFTER_CLICK = False
+INPUT_TARGET_WINDOW_TITLE = "卡厄思梦境"
+_INPUT_TARGET_HWND_CACHE = 0
 
 # 识别等待轮询间隔，用在等待“脱逃页/确认弹窗/回首页”等关键状态。
 
@@ -564,6 +597,11 @@ CONFIG_BINDINGS = {
         "delay_unknown_idle": ("DELAY_UNKNOWN_IDLE", "nonnegative_float"),
         "delay_after_legend_confirm": ("DELAY_AFTER_LEGEND_CONFIRM", "nonnegative_float"),
     },
+    "input": {
+        "backend": ("INPUT_BACKEND", "input_backend"),
+        "restore_cursor_after_click": ("RESTORE_CURSOR_AFTER_CLICK", "bool"),
+        "target_window_title": ("INPUT_TARGET_WINDOW_TITLE", "string"),
+    },
 }
 
 
@@ -631,6 +669,12 @@ def default_user_config() -> dict:
             "delay_unknown_idle": DELAY_UNKNOWN_IDLE,
             "delay_after_legend_confirm": DELAY_AFTER_LEGEND_CONFIRM,
         },
+        "input": {
+            "_说明": "输入方式。sendinput 是默认真实鼠标点击；postmessage/postmessage_activate 是实验后台消息点击，可能被游戏忽略。",
+            "backend": INPUT_BACKEND,
+            "restore_cursor_after_click": RESTORE_CURSOR_AFTER_CLICK,
+            "target_window_title": INPUT_TARGET_WINDOW_TITLE,
+        },
     }
 
 
@@ -679,6 +723,23 @@ def _coerce_config_value(value: object, kind: str, label: str) -> object:
         if text not in {"rapid", "checked"}:
             raise ValueError(f"{label} must be rapid or checked")
         return text
+    if kind == "input_backend":
+        text = str(value).strip().lower().replace("-", "_")
+        if text not in INPUT_BACKENDS:
+            raise ValueError(f"{label} must be one of {', '.join(sorted(INPUT_BACKENDS))}")
+        return text
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "yes", "on"}:
+                return True
+            if text in {"0", "false", "no", "off"}:
+                return False
+        raise ValueError(f"{label} must be true or false")
+    if kind == "string":
+        return str(value).strip()
     raise ValueError(f"unknown config type {kind}")
 
 
@@ -1113,14 +1174,14 @@ def _screen_shot_dxgi(monitor_index: int) -> tuple[np.ndarray, dict]:
     return frame.copy(), _monitor_meta(monitor_index)
 
 
-def screen_shot(monitor_index: int, capture_method: str = "dxgi") -> tuple[np.ndarray, dict]:
-    if capture_method == "dxgi":
+def screen_shot(monitor_index: int, capture_method: str = CAPTURE_METHOD_DXGI) -> tuple[np.ndarray, dict]:
+    if capture_method in {CAPTURE_METHOD_AUTO, CAPTURE_METHOD_DXGI}:
         try:
             return _screen_shot_dxgi(monitor_index)
         except Exception as exc:
             print(f"DXGI capture failed, falling back to mss: {exc}", flush=True)
             return _screen_shot_mss(monitor_index)
-    if capture_method == "mss":
+    if capture_method == CAPTURE_METHOD_MSS:
         return _screen_shot_mss(monitor_index)
     raise ValueError(f"unknown capture method: {capture_method}")
 
@@ -1265,8 +1326,14 @@ def fast_advance_unknown(
     max_taps: int = DIALOG_BURST_MAX_TAPS,
     tap_delay: float = DIALOG_BURST_TAP_DELAY,
     mode: str = DIALOG_BURST_MODE,
+    max_total_clicks: int | None = None,
 ) -> int:
     if stop_requested(stop_keys, stop_file):
+        return 0
+    if max_total_clicks is not None:
+        max_taps = min(max_taps, max(0, max_total_clicks))
+    if max_taps <= 0:
+        print("advance/continue burst skipped: max click budget reached.")
         return 0
     print_action(f"advance/continue burst x{max_taps} mode={mode}", CLICK_ADVANCE, act)
     if act and mode == "rapid":
@@ -1298,9 +1365,14 @@ def fast_advance_unknown(
             print("dialog rapid burst postcheck stopped; skip fallback clicks.")
             return clicks
 
+        remaining = None if max_total_clicks is None else max(0, max_total_clicks - clicks)
+        fallback_taps = DIALOG_BURST_FALLBACK_TAPS if remaining is None else min(DIALOG_BURST_FALLBACK_TAPS, remaining)
+        if fallback_taps <= 0:
+            print("dialog rapid burst fallback skipped: max click budget reached.")
+            return clicks
         print(
             f"dialog rapid burst fallback: no next state after {clicks} rapid taps; "
-            f"switching to checked fallback x{DIALOG_BURST_FALLBACK_TAPS}."
+            f"switching to checked fallback x{fallback_taps}."
         )
         clicks += checked_dialog_advance(
             detector,
@@ -1310,7 +1382,7 @@ def fast_advance_unknown(
             stop_keys,
             stop_file,
             act,
-            max_taps=DIALOG_BURST_FALLBACK_TAPS,
+            max_taps=fallback_taps,
             tap_delay=DIALOG_BURST_FALLBACK_TAP_DELAY,
             prefix="dialog fallback",
         )
@@ -1497,6 +1569,10 @@ class Input(ctypes.Structure):
     _fields_ = (("type", ctypes.c_ulong), ("union", InputUnion))
 
 
+class Point(ctypes.Structure):
+    _fields_ = (("x", ctypes.c_long), ("y", ctypes.c_long))
+
+
 def _send_mouse(flags: int, x: int | None = None, y: int | None = None) -> bool:
     mi = MouseInput()
     if x is not None and y is not None:
@@ -1515,7 +1591,21 @@ def _send_mouse(flags: int, x: int | None = None, y: int | None = None) -> bool:
     return ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp)) == 1
 
 
-def click_screen_xy(x: int, y: int, duration: float = 0.08) -> None:
+def cursor_pos() -> tuple[int, int] | None:
+    point = Point()
+    if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+        return (int(point.x), int(point.y))
+    return None
+
+
+def restore_cursor_pos(point: tuple[int, int] | None) -> None:
+    if point is None:
+        return
+    ctypes.windll.user32.SetCursorPos(point[0], point[1])
+
+
+def click_screen_xy_sendinput(x: int, y: int, duration: float = 0.08) -> None:
+    saved_cursor = cursor_pos() if RESTORE_CURSOR_AFTER_CLICK else None
     hwnd = window_at(x, y)
     if hwnd:
         ensure_foreground_and_top(hwnd)
@@ -1527,6 +1617,223 @@ def click_screen_xy(x: int, y: int, duration: float = 0.08) -> None:
     time.sleep(duration)
     _send_mouse(0x0004)
     time.sleep(CLICK_AFTER_UP_DELAY)
+    restore_cursor_pos(saved_cursor)
+
+
+def _make_lparam(x: int, y: int) -> int:
+    return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+
+
+def _window_title(hwnd: int) -> str:
+    title = ctypes.create_unicode_buffer(512)
+    ctypes.windll.user32.GetWindowTextW(hwnd, title, len(title))
+    return title.value
+
+
+def _window_contains_point(hwnd: int, x: int, y: int) -> bool:
+    rect = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    return rect.left <= x < rect.right and rect.top <= y < rect.bottom
+
+
+def _client_area_on_screen(hwnd: int) -> dict | None:
+    user32 = ctypes.windll.user32
+    if not hwnd or not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
+        return None
+    rect = wintypes.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
+    origin = Point(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+        return None
+    width = int(rect.right - rect.left)
+    height = int(rect.bottom - rect.top)
+    if width <= 0 or height <= 0:
+        return None
+    return {
+        "left": int(origin.x),
+        "top": int(origin.y),
+        "width": width,
+        "height": height,
+        "source": "target_window_client",
+        "hwnd": int(hwnd),
+        "title": _window_title(hwnd),
+    }
+
+
+def _area_intersects_monitor(area: dict, monitor: dict) -> bool:
+    left = int(area["left"])
+    top = int(area["top"])
+    right = left + int(area["width"])
+    bottom = top + int(area["height"])
+    mon_left = int(monitor["left"])
+    mon_top = int(monitor["top"])
+    mon_right = mon_left + int(monitor["width"])
+    mon_bottom = mon_top + int(monitor["height"])
+    return left < mon_right and right > mon_left and top < mon_bottom and bottom > mon_top
+
+
+def _find_window_by_title_at_point(title_part: str, x: int, y: int) -> int:
+    needle = title_part.strip().lower()
+    if not needle:
+        return 0
+
+    user32 = ctypes.windll.user32
+    found = ctypes.c_void_p(0)
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_proc(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = _window_title(hwnd).lower()
+        if needle in title and _window_contains_point(hwnd, x, y):
+            found.value = int(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    return int(found.value or 0)
+
+
+def _find_window_by_title_on_monitor(title_part: str, monitor: dict) -> int:
+    needle = title_part.strip().lower()
+    if not needle:
+        return 0
+
+    user32 = ctypes.windll.user32
+    found = ctypes.c_void_p(0)
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_proc(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = _window_title(hwnd).lower()
+        area = _client_area_on_screen(hwnd)
+        if needle in title and area and _area_intersects_monitor(area, monitor):
+            found.value = int(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    return int(found.value or 0)
+
+
+def _cached_title_window(title_part: str, x: int, y: int) -> int:
+    global _INPUT_TARGET_HWND_CACHE
+    user32 = ctypes.windll.user32
+    hwnd = _INPUT_TARGET_HWND_CACHE
+    needle = title_part.strip().lower()
+    if (
+        hwnd
+        and user32.IsWindow(hwnd)
+        and user32.IsWindowVisible(hwnd)
+        and needle in _window_title(hwnd).lower()
+        and _window_contains_point(hwnd, x, y)
+    ):
+        return hwnd
+    hwnd = _find_window_by_title_at_point(title_part, x, y)
+    _INPUT_TARGET_HWND_CACHE = hwnd
+    return hwnd
+
+
+def _cached_title_window_on_monitor(title_part: str, monitor: dict) -> int:
+    global _INPUT_TARGET_HWND_CACHE
+    user32 = ctypes.windll.user32
+    hwnd = _INPUT_TARGET_HWND_CACHE
+    needle = title_part.strip().lower()
+    area = _client_area_on_screen(hwnd) if hwnd else None
+    if (
+        hwnd
+        and user32.IsWindow(hwnd)
+        and user32.IsWindowVisible(hwnd)
+        and needle in _window_title(hwnd).lower()
+        and area
+        and _area_intersects_monitor(area, monitor)
+    ):
+        return hwnd
+    hwnd = _find_window_by_title_on_monitor(title_part, monitor)
+    _INPUT_TARGET_HWND_CACHE = hwnd
+    return hwnd
+
+
+def click_area_for(monitor: dict) -> dict:
+    if INPUT_TARGET_WINDOW_TITLE:
+        hwnd = _cached_title_window_on_monitor(INPUT_TARGET_WINDOW_TITLE, monitor)
+        area = _client_area_on_screen(hwnd) if hwnd else None
+        if area:
+            return area
+    return {
+        "left": int(monitor["left"]),
+        "top": int(monitor["top"]),
+        "width": int(monitor["width"]),
+        "height": int(monitor["height"]),
+        "source": "monitor",
+    }
+
+
+def message_target_at(x: int, y: int) -> int:
+    if INPUT_TARGET_WINDOW_TITLE:
+        hwnd = _cached_title_window(INPUT_TARGET_WINDOW_TITLE, x, y)
+        if hwnd:
+            return _message_target_for(hwnd)
+        print(
+            f"postmessage target title not found at ({x},{y}): {INPUT_TARGET_WINDOW_TITLE!r}; "
+            "falling back to WindowFromPoint",
+            flush=True,
+        )
+    return _message_target_for(window_at(x, y))
+
+
+def _message_target_for(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    user32 = ctypes.windll.user32
+    root = int(user32.GetAncestor(hwnd, 3)) or hwnd
+    popup = int(user32.GetLastActivePopup(root))
+    if popup and popup != hwnd and user32.IsWindowVisible(popup):
+        return popup
+    return hwnd
+
+
+def _screen_to_client(hwnd: int, x: int, y: int) -> tuple[int, int]:
+    point = Point(x, y)
+    ctypes.windll.user32.ScreenToClient(hwnd, ctypes.byref(point))
+    return (int(point.x), int(point.y))
+
+
+def post_message_click_screen_xy(x: int, y: int, duration: float = 0.08, activate: bool = False) -> None:
+    target = message_target_at(x, y)
+    if not target:
+        print(f"postmessage click skipped: no window at ({x},{y})", flush=True)
+        return
+    user32 = ctypes.windll.user32
+    if activate:
+        user32.PostMessageW(target, WM_ACTIVATE, WA_ACTIVE, 0)
+        time.sleep(0.01)
+    cx, cy = _screen_to_client(target, x, y)
+    lparam = _make_lparam(cx, cy)
+    ok_move = user32.PostMessageW(target, WM_MOUSEMOVE, 0, lparam)
+    ok_down = user32.PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+    time.sleep(duration)
+    ok_up = user32.PostMessageW(target, WM_LBUTTONUP, 0, lparam)
+    time.sleep(CLICK_AFTER_UP_DELAY)
+    if not (ok_move and ok_down and ok_up):
+        print(
+            f"postmessage click warning: target=0x{target:x} client=({cx},{cy}) "
+            f"ok_move={ok_move} ok_down={ok_down} ok_up={ok_up}",
+            flush=True,
+        )
+
+
+def click_screen_xy(x: int, y: int, duration: float = 0.08) -> None:
+    if INPUT_BACKEND == INPUT_BACKEND_POSTMESSAGE:
+        post_message_click_screen_xy(x, y, duration=duration, activate=False)
+        return
+    if INPUT_BACKEND == INPUT_BACKEND_POSTMESSAGE_ACTIVATE:
+        post_message_click_screen_xy(x, y, duration=duration, activate=True)
+        return
+    click_screen_xy_sendinput(x, y, duration=duration)
 
 
 def ensure_foreground_and_top(hwnd: int) -> bool:
@@ -1567,15 +1874,13 @@ def click_log_suffix(x: int, y: int) -> str:
 
 
 def window_at(x: int, y: int) -> int:
-    class Point(ctypes.Structure):
-        _fields_ = (("x", ctypes.c_long), ("y", ctypes.c_long))
-
     return int(ctypes.windll.user32.WindowFromPoint(Point(x, y)))
 
 
 def click_norm(point: tuple[float, float], monitor: dict, duration: float = 0.08) -> None:
-    x = int(monitor["left"] + monitor["width"] * point[0])
-    y = int(monitor["top"] + monitor["height"] * point[1])
+    area = click_area_for(monitor)
+    x = int(area["left"] + area["width"] * point[0])
+    y = int(area["top"] + area["height"] * point[1])
     print(f"click screen=({x},{y}){click_log_suffix(x, y)}", flush=True)
     click_screen_xy(x, y, duration=duration)
 
@@ -1589,9 +1894,24 @@ def rapid_click_norm(
     stop_keys: list[str],
     stop_file: Path | None,
 ) -> int:
-    x = int(monitor["left"] + monitor["width"] * point[0])
-    y = int(monitor["top"] + monitor["height"] * point[1])
+    area = click_area_for(monitor)
+    x = int(area["left"] + area["width"] * point[0])
+    y = int(area["top"] + area["height"] * point[1])
     print(f"rapid click screen=({x},{y}) count={count}{click_log_suffix(x, y)}", flush=True)
+    if INPUT_BACKEND in {INPUT_BACKEND_POSTMESSAGE, INPUT_BACKEND_POSTMESSAGE_ACTIVATE}:
+        for sent in range(count):
+            if stop_requested(stop_keys, stop_file):
+                return sent
+            post_message_click_screen_xy(
+                x,
+                y,
+                duration=duration,
+                activate=INPUT_BACKEND == INPUT_BACKEND_POSTMESSAGE_ACTIVATE,
+            )
+            if sleep_interruptible(interval, stop_keys, stop_file):
+                return sent + 1
+        return count
+    saved_cursor = cursor_pos() if RESTORE_CURSOR_AFTER_CLICK else None
     hwnd = window_at(x, y)
     if hwnd:
         ensure_foreground_and_top(hwnd)
@@ -1599,13 +1919,16 @@ def rapid_click_norm(
     sent = 0
     for _ in range(count):
         if stop_requested(stop_keys, stop_file):
+            restore_cursor_pos(saved_cursor)
             return sent
         _send_mouse(0x0002)
         time.sleep(duration)
         _send_mouse(0x0004)
         sent += 1
         if sleep_interruptible(interval, stop_keys, stop_file):
+            restore_cursor_pos(saved_cursor)
             return sent
+    restore_cursor_pos(saved_cursor)
     return sent
 
 
@@ -1707,6 +2030,8 @@ class LiveSession:
             f"no_dream_action={cfg.no_dream_action}, advance_on_unknown={cfg.advance_on_unknown}, "
             f"fast_start_to_team={cfg.fast_start_to_team_enabled}, post_click_wait={cfg.post_click_wait}, "
             f"wait_after_team_enter={cfg.wait_after_team_enter}, dialog_burst_mode={cfg.dialog_burst_mode}, "
+            f"input_backend={INPUT_BACKEND}, restore_cursor_after_click={RESTORE_CURSOR_AFTER_CLICK}, "
+            f"target_window_title={INPUT_TARGET_WINDOW_TITLE!r}, "
             f"stop_file={cfg.stop_file}"
         )
         print(
@@ -2168,6 +2493,7 @@ class LiveSession:
             cfg.stop_keys,
             cfg.stop_file,
             cfg.act,
+            max_total_clicks=(cfg.max_clicks - rt.click_count) if cfg.max_clicks > 0 else None,
         )
         rt.click_count += burst_clicks
         if burst_clicks > 0:
@@ -2270,12 +2596,29 @@ def main() -> None:
         default=DIALOG_BURST_MODE,
         help="Dialog advance burst behavior. rapid keeps the old fast continuous clicks; checked re-detects after each tap.",
     )
+    parser.add_argument(
+        "--input-backend",
+        choices=sorted(INPUT_BACKENDS),
+        default=INPUT_BACKEND,
+        help="Click backend. sendinput is stable foreground input; postmessage modes are experimental background messages.",
+    )
+    parser.add_argument(
+        "--restore-cursor-after-click",
+        action=argparse.BooleanOptionalAction,
+        default=RESTORE_CURSOR_AFTER_CLICK,
+        help="Move the cursor back to its previous position after sendinput clicks.",
+    )
+    parser.add_argument(
+        "--target-window-title",
+        default=INPUT_TARGET_WINDOW_TITLE,
+        help="Prefer a visible window whose title contains this text for postmessage clicks.",
+    )
     parser.add_argument("--monitor", type=int, default=1, help="monitor index. 1 is primary on this machine; 2 is the secondary display.")
     parser.add_argument(
         "--capture-method",
-        choices=["dxgi", "mss"],
-        default="dxgi",
-        help="Live screenshot backend. DXGI is the default because mss returned stale frames after clicks in this game.",
+        choices=sorted(CAPTURE_METHODS),
+        default=CAPTURE_METHOD_DXGI,
+        help="Live screenshot backend. auto/dxgi try DXGI first and fall back to mss; mss forces the older backend.",
     )
     parser.add_argument("--advance-on-unknown", action="store_true", help="Allow live mode to click the advance point when no known UI state is detected.")
     parser.add_argument(
@@ -2301,6 +2644,9 @@ def main() -> None:
         help="What live mode should do on a card reward screen when 梦之边境 is not detected.",
     )
     args = parser.parse_args()
+    globals()["INPUT_BACKEND"] = args.input_backend
+    globals()["RESTORE_CURSOR_AFTER_CLICK"] = args.restore_cursor_after_click
+    globals()["INPUT_TARGET_WINDOW_TITLE"] = args.target_window_title.strip()
 
     log_path = None
     if not args.no_run_log:

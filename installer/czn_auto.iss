@@ -38,6 +38,7 @@ Source: "..\CONFIG.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
 Type: files; Name: "{app}\run_min_loop.bat"
+Type: files; Name: "{app}\start_czn_auto_mouse.bat"
 
 [Icons]
 Name: "{group}\CZN Auto"; Filename: "{app}\start_czn_auto.bat"; WorkingDir: "{app}"

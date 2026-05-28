@@ -8,8 +8,8 @@ if %errorlevel% neq 0 (
   exit /b
 )
 del .\STOP 2>nul
-echo Starting CZN Auto as administrator on monitor 1.
+echo Starting CZN Auto with background window input as administrator on monitor 1.
 echo Stop keys: F8, ESC, PAUSE, END
 echo Emergency kill: run czn_auto\stop_czn_auto.bat
-python .\czn_auto\czn_detector.py --live --act --advance-on-unknown --fast-start-to-team --wide-match-scales
+python .\czn_auto\czn_detector.py --live --act --input-backend postmessage_activate --advance-on-unknown --fast-start-to-team --wide-match-scales
 pause

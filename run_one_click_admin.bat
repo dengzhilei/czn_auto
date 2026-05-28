@@ -8,7 +8,7 @@ if %errorlevel% neq 0 (
   exit /b
 )
 del .\STOP 2>nul
-echo Admin one-click test on monitor 1.
+echo Background one-click test as administrator on monitor 1.
 echo Stop keys: F8, ESC, PAUSE, END
-python .\czn_auto\czn_detector.py --live --act --advance-on-unknown --fast-start-to-team --max-seconds 8 --max-clicks 1
+python .\czn_auto\czn_detector.py --live --act --input-backend postmessage_activate --advance-on-unknown --fast-start-to-team --max-seconds 8 --max-clicks 1
 pause
