@@ -133,3 +133,7 @@ templates\
 ```
 
 日志开头会打印实际读取的 `config.json`、点击坐标和等待时间。配置写错时会打印 warning，并继续使用默认值。
+## input 字段
+
+- `backend`: 输入后端。`sendinput` 是默认真实鼠标点击，最稳；`postmessage` 和 `postmessage_activate` 是实验后台消息点击，可能被游戏忽略。当前测试里 `postmessage_activate` 可以点击游戏内配队进入按钮。
+- `restore_cursor_after_click`: 仅对 `sendinput` 有效。设为 `true` 时，每次点击后把鼠标移回点击前的位置，可以减轻对日常鼠标的打扰，但点击瞬间仍会占用鼠标。

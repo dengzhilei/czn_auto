@@ -60,5 +60,10 @@
     "delay_after_unknown_burst": 0.05,
     "delay_unknown_idle": 0.3,
     "delay_after_legend_confirm": 1.0
+  },
+  "input": {
+    "_说明": "输入方式。sendinput 是默认真实鼠标点击；postmessage/postmessage_activate 是实验后台消息点击，可能被游戏忽略。",
+    "backend": "sendinput",
+    "restore_cursor_after_click": false
   }
 }

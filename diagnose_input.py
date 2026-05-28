@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import argparse
 import os
 from ctypes import wintypes
 
@@ -23,6 +24,9 @@ TokenIntegrityLevel = 25
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
+WM_ACTIVATE = 0x0006
+WA_ACTIVE = 1
+MK_LBUTTON = 0x0001
 
 
 class SID_AND_ATTRIBUTES(ctypes.Structure):
@@ -95,18 +99,55 @@ def foreground_info() -> str:
 def post_message_probe(hwnd: int, x: int, y: int) -> list[str]:
     client = POINT(x, y)
     user32.ScreenToClient(hwnd, ctypes.byref(client))
-    lparam = (client.y << 16) | (client.x & 0xFFFF)
+    lparam = ((client.y & 0xFFFF) << 16) | (client.x & 0xFFFF)
     out = [f"client_point=({client.x},{client.y}) lparam=0x{lparam:x}"]
-    for msg, wp in ((WM_MOUSEMOVE, 0), (WM_LBUTTONDOWN, 1), (WM_LBUTTONUP, 0)):
+    for msg, wp in ((WM_MOUSEMOVE, 0), (WM_LBUTTONDOWN, MK_LBUTTON), (WM_LBUTTONUP, 0)):
         ctypes.set_last_error(0)
         ok = user32.PostMessageW(hwnd, msg, wp, lparam)
         out.append(f"PostMessage {hex(msg)} ok={ok} err={ctypes.get_last_error()}")
     return out
 
 
+def target_candidates(hwnd: int) -> list[tuple[str, int]]:
+    root = int(user32.GetAncestor(hwnd, 3)) or hwnd
+    popup = int(user32.GetLastActivePopup(root)) or root
+    candidates = [("window_at_point", hwnd), ("root_owner", root), ("active_popup", popup)]
+    deduped: list[tuple[str, int]] = []
+    seen: set[int] = set()
+    for label, target in candidates:
+        if target and target not in seen:
+            deduped.append((label, target))
+            seen.add(target)
+    return deduped
+
+
+def window_title(hwnd: int) -> str:
+    title = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(hwnd, title, 256)
+    return title.value
+
+
+def probe_candidate(label: str, hwnd: int, x: int, y: int, activate: bool) -> None:
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    print(f"[{label}] hwnd=0x{hwnd:x} pid={pid.value} title={window_title(hwnd)!r}")
+    if activate:
+        ctypes.set_last_error(0)
+        ok = user32.PostMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
+        print(f"PostMessage WM_ACTIVATE ok={ok} err={ctypes.get_last_error()}")
+    for line in post_message_probe(hwnd, x, y):
+        print(line)
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Probe whether a window accepts background mouse messages.")
+    parser.add_argument("--x", type=int, default=3590, help="Screen x coordinate to click/probe.")
+    parser.add_argument("--y", type=int, default=1885, help="Screen y coordinate to click/probe.")
+    parser.add_argument("--activate", action="store_true", help="Also send WM_ACTIVATE before mouse messages.")
+    args = parser.parse_args()
+
     set_dpi_awareness()
-    x, y = 3590, 1885
+    x, y = args.x, args.y
     hwnd = window_at(x, y)
     pid = wintypes.DWORD()
     ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -118,8 +159,8 @@ def main() -> None:
     print(f"target_at=({x},{y}) {describe_window_at(x, y)}")
     print(f"target_integrity={integrity_name(target_rid)} status={target_status}")
     print(f"foreground={foreground_info()}")
-    for line in post_message_probe(hwnd, x, y):
-        print(line)
+    for label, target in target_candidates(hwnd):
+        probe_candidate(label, target, x, y, args.activate)
 
 
 if __name__ == "__main__":

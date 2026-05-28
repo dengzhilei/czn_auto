@@ -147,6 +147,17 @@ config.json
 
 [CONFIG.md](./CONFIG.md)
 
+输入方式也在配置里：
+
+```json
+"input": {
+  "backend": "sendinput",
+  "restore_cursor_after_click": false
+}
+```
+
+`sendinput` 是默认真实鼠标点击，最稳；`postmessage` 和 `postmessage_activate` 是实验后台消息点击，可能被游戏忽略。当前测试里 `postmessage_activate` 可以点击游戏内配队进入按钮。`restore_cursor_after_click` 可以在真实点击后把鼠标移回原位置，只是点击瞬间仍会占用鼠标。
+
 坐标使用比例，不是像素。例如：
 
 ```json
