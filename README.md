@@ -44,7 +44,7 @@ CZNAutoSetup-0.1.0.exe
 CZNAuto-portable.zip
 ```
 
-这是便携版，解压后双击 `run_min_loop.bat` 运行。
+这是便携版，解压后双击 `start_czn_auto.bat` 运行。
 
 ## 使用前注意
 
@@ -103,7 +103,7 @@ F8 / Esc / Pause / End
 ## 便携版使用
 
 1. 下载并解压 `CZNAuto-portable.zip`。
-2. 双击 `run_min_loop.bat` 运行完整循环。
+2. 双击 `start_czn_auto.bat` 运行完整循环。
 3. 首次使用建议先双击 `run_one_click.bat` 测试一次点击。
 4. 如需强制停止，双击 `stop_czn_auto.bat`。
 5. 如需修改配置，双击 `open_config.bat`。
@@ -111,8 +111,8 @@ F8 / Esc / Pause / End
 便携版目录里的主要文件：
 
 ```text
-CZNAuto.exe             主程序
-run_min_loop.bat        常规运行脚本
+start_czn_auto.bat      正式启动脚本，普通用户双击这个
+CZNAuto.exe             主程序本体，不建议直接双击
 run_one_click.bat       单次点击测试脚本
 stop_czn_auto.bat       停止脚本
 open_config.bat         打开配置
@@ -374,7 +374,7 @@ python czn_detector.py --image path\to\screenshot.jpg --out-dir out
 常用开发脚本：
 
 ```text
-run_min_loop_admin.bat
+start_czn_auto_admin.bat
 run_one_click_admin.bat
 stop_czn_auto.bat
 ```
@@ -412,8 +412,10 @@ CONFIG.md                配置字段说明
 installer\czn_auto.iss   Inno Setup 安装包脚本
 czn_auto.spec            PyInstaller 打包配置
 build_release.bat        本地打包脚本
-run_*_admin.bat          开发环境运行脚本
-run_*_exe.bat            发布包运行脚本
+start_*_admin.bat        开发环境正式启动脚本
+start_*_exe.bat          发布包正式启动脚本
+run_*_admin.bat          其他开发环境运行脚本
+run_*_exe.bat            其他发布包运行脚本
 STATE_MAP.md             状态流程说明
 LESSONS.md               调试经验记录
 ```
