@@ -62,8 +62,9 @@
     "delay_after_legend_confirm": 1.0
   },
   "input": {
-    "_说明": "输入方式。sendinput 是默认真实鼠标点击；postmessage/postmessage_activate 是实验后台消息点击，可能被游戏忽略。",
-    "backend": "sendinput",
-    "restore_cursor_after_click": false
+    "_说明": "输入方式。postmessage_activate 是默认后台窗口点击，通常不占用真实鼠标；sendinput 是真实鼠标兼容模式。",
+    "backend": "postmessage_activate",
+    "restore_cursor_after_click": false,
+    "target_window_title": "卡厄思梦境"
   }
 }

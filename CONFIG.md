@@ -135,5 +135,6 @@ templates\
 日志开头会打印实际读取的 `config.json`、点击坐标和等待时间。配置写错时会打印 warning，并继续使用默认值。
 ## input 字段
 
-- `backend`: 输入后端。`sendinput` 是默认真实鼠标点击，最稳；`postmessage` 和 `postmessage_activate` 是实验后台消息点击，可能被游戏忽略。当前测试里 `postmessage_activate` 可以点击游戏内配队进入按钮。
+- `backend`: 输入后端。`postmessage_activate` 是默认后台窗口点击，通常不会移动或占用真实鼠标；当前测试里已经跑通配队进入、对白推进、传说选择、奖励页退出、回首页和继续下一轮。`sendinput` 是真实鼠标兼容模式，稳定但会占用鼠标。
 - `restore_cursor_after_click`: 仅对 `sendinput` 有效。设为 `true` 时，每次点击后把鼠标移回点击前的位置，可以减轻对日常鼠标的打扰，但点击瞬间仍会占用鼠标。
+- `target_window_title`: 仅对 `postmessage` / `postmessage_activate` 有效。默认 `卡厄思梦境`，程序会优先把后台点击消息发给标题匹配且覆盖该坐标的窗口；设为空字符串时退回按点击坐标下方窗口发送消息。

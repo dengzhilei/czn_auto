@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-echo Starting CZN Auto.
+echo Starting CZN Auto with background window input.
 echo Stop keys: F8, ESC, PAUSE, END
-CZNAuto.exe --live --act --advance-on-unknown --fast-start-to-team --wide-match-scales
+CZNAuto.exe --live --act --input-backend postmessage_activate --advance-on-unknown --fast-start-to-team --wide-match-scales
 pause

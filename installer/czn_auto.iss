@@ -29,6 +29,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Files]
 Source: "..\dist\CZNAuto\*"; DestDir: "{app}"; Excludes: "config.json"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\start_czn_auto_exe.bat"; DestDir: "{app}"; DestName: "start_czn_auto.bat"; Flags: ignoreversion
+Source: "..\start_czn_auto_mouse_exe.bat"; DestDir: "{app}"; DestName: "start_czn_auto_mouse.bat"; Flags: ignoreversion
 Source: "..\run_one_click_exe.bat"; DestDir: "{app}"; DestName: "run_one_click.bat"; Flags: ignoreversion
 Source: "..\stop_czn_auto_exe.bat"; DestDir: "{app}"; DestName: "stop_czn_auto.bat"; Flags: ignoreversion
 Source: "..\open_config_exe.bat"; DestDir: "{app}"; DestName: "open_config.bat"; Flags: ignoreversion

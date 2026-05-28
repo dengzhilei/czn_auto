@@ -11,6 +11,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from ctypes import wintypes
 from typing import Iterable
 
 import cv2
@@ -285,6 +286,7 @@ def runtime_click_profile() -> dict:
     return {
         "input_backend": INPUT_BACKEND,
         "restore_cursor_after_click": RESTORE_CURSOR_AFTER_CLICK,
+        "target_window_title": INPUT_TARGET_WINDOW_TITLE,
         "advance": CLICK_ADVANCE,
         "choice_right": CLICK_CHOICE_RIGHT,
         "confirm": CLICK_CONFIRM,
@@ -489,8 +491,10 @@ POST_CLICK_WAIT = 4.0
 REWARD_SETTLE_BEFORE_ACTION = 1.5
 SAVE_VISUAL_CHANGE_DEBUG = False
 LOG_CLICK_WINDOW = False
-INPUT_BACKEND = INPUT_BACKEND_SENDINPUT
+INPUT_BACKEND = INPUT_BACKEND_POSTMESSAGE_ACTIVATE
 RESTORE_CURSOR_AFTER_CLICK = False
+INPUT_TARGET_WINDOW_TITLE = "卡厄思梦境"
+_INPUT_TARGET_HWND_CACHE = 0
 
 # 识别等待轮询间隔，用在等待“脱逃页/确认弹窗/回首页”等关键状态。
 
@@ -596,6 +600,7 @@ CONFIG_BINDINGS = {
     "input": {
         "backend": ("INPUT_BACKEND", "input_backend"),
         "restore_cursor_after_click": ("RESTORE_CURSOR_AFTER_CLICK", "bool"),
+        "target_window_title": ("INPUT_TARGET_WINDOW_TITLE", "string"),
     },
 }
 
@@ -668,6 +673,7 @@ def default_user_config() -> dict:
             "_说明": "输入方式。sendinput 是默认真实鼠标点击；postmessage/postmessage_activate 是实验后台消息点击，可能被游戏忽略。",
             "backend": INPUT_BACKEND,
             "restore_cursor_after_click": RESTORE_CURSOR_AFTER_CLICK,
+            "target_window_title": INPUT_TARGET_WINDOW_TITLE,
         },
     }
 
@@ -732,6 +738,8 @@ def _coerce_config_value(value: object, kind: str, label: str) -> object:
             if text in {"0", "false", "no", "off"}:
                 return False
         raise ValueError(f"{label} must be true or false")
+    if kind == "string":
+        return str(value).strip()
     raise ValueError(f"unknown config type {kind}")
 
 
@@ -1318,8 +1326,14 @@ def fast_advance_unknown(
     max_taps: int = DIALOG_BURST_MAX_TAPS,
     tap_delay: float = DIALOG_BURST_TAP_DELAY,
     mode: str = DIALOG_BURST_MODE,
+    max_total_clicks: int | None = None,
 ) -> int:
     if stop_requested(stop_keys, stop_file):
+        return 0
+    if max_total_clicks is not None:
+        max_taps = min(max_taps, max(0, max_total_clicks))
+    if max_taps <= 0:
+        print("advance/continue burst skipped: max click budget reached.")
         return 0
     print_action(f"advance/continue burst x{max_taps} mode={mode}", CLICK_ADVANCE, act)
     if act and mode == "rapid":
@@ -1351,9 +1365,14 @@ def fast_advance_unknown(
             print("dialog rapid burst postcheck stopped; skip fallback clicks.")
             return clicks
 
+        remaining = None if max_total_clicks is None else max(0, max_total_clicks - clicks)
+        fallback_taps = DIALOG_BURST_FALLBACK_TAPS if remaining is None else min(DIALOG_BURST_FALLBACK_TAPS, remaining)
+        if fallback_taps <= 0:
+            print("dialog rapid burst fallback skipped: max click budget reached.")
+            return clicks
         print(
             f"dialog rapid burst fallback: no next state after {clicks} rapid taps; "
-            f"switching to checked fallback x{DIALOG_BURST_FALLBACK_TAPS}."
+            f"switching to checked fallback x{fallback_taps}."
         )
         clicks += checked_dialog_advance(
             detector,
@@ -1363,7 +1382,7 @@ def fast_advance_unknown(
             stop_keys,
             stop_file,
             act,
-            max_taps=DIALOG_BURST_FALLBACK_TAPS,
+            max_taps=fallback_taps,
             tap_delay=DIALOG_BURST_FALLBACK_TAP_DELAY,
             prefix="dialog fallback",
         )
@@ -1605,6 +1624,72 @@ def _make_lparam(x: int, y: int) -> int:
     return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
 
 
+def _window_title(hwnd: int) -> str:
+    title = ctypes.create_unicode_buffer(512)
+    ctypes.windll.user32.GetWindowTextW(hwnd, title, len(title))
+    return title.value
+
+
+def _window_contains_point(hwnd: int, x: int, y: int) -> bool:
+    rect = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    return rect.left <= x < rect.right and rect.top <= y < rect.bottom
+
+
+def _find_window_by_title_at_point(title_part: str, x: int, y: int) -> int:
+    needle = title_part.strip().lower()
+    if not needle:
+        return 0
+
+    user32 = ctypes.windll.user32
+    found = ctypes.c_void_p(0)
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_proc(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = _window_title(hwnd).lower()
+        if needle in title and _window_contains_point(hwnd, x, y):
+            found.value = int(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    return int(found.value or 0)
+
+
+def _cached_title_window(title_part: str, x: int, y: int) -> int:
+    global _INPUT_TARGET_HWND_CACHE
+    user32 = ctypes.windll.user32
+    hwnd = _INPUT_TARGET_HWND_CACHE
+    needle = title_part.strip().lower()
+    if (
+        hwnd
+        and user32.IsWindow(hwnd)
+        and user32.IsWindowVisible(hwnd)
+        and needle in _window_title(hwnd).lower()
+        and _window_contains_point(hwnd, x, y)
+    ):
+        return hwnd
+    hwnd = _find_window_by_title_at_point(title_part, x, y)
+    _INPUT_TARGET_HWND_CACHE = hwnd
+    return hwnd
+
+
+def message_target_at(x: int, y: int) -> int:
+    if INPUT_TARGET_WINDOW_TITLE:
+        hwnd = _cached_title_window(INPUT_TARGET_WINDOW_TITLE, x, y)
+        if hwnd:
+            return _message_target_for(hwnd)
+        print(
+            f"postmessage target title not found at ({x},{y}): {INPUT_TARGET_WINDOW_TITLE!r}; "
+            "falling back to WindowFromPoint",
+            flush=True,
+        )
+    return _message_target_for(window_at(x, y))
+
+
 def _message_target_for(hwnd: int) -> int:
     if not hwnd:
         return 0
@@ -1623,8 +1708,7 @@ def _screen_to_client(hwnd: int, x: int, y: int) -> tuple[int, int]:
 
 
 def post_message_click_screen_xy(x: int, y: int, duration: float = 0.08, activate: bool = False) -> None:
-    hwnd = window_at(x, y)
-    target = _message_target_for(hwnd)
+    target = message_target_at(x, y)
     if not target:
         print(f"postmessage click skipped: no window at ({x},{y})", flush=True)
         return
@@ -1850,6 +1934,7 @@ class LiveSession:
             f"fast_start_to_team={cfg.fast_start_to_team_enabled}, post_click_wait={cfg.post_click_wait}, "
             f"wait_after_team_enter={cfg.wait_after_team_enter}, dialog_burst_mode={cfg.dialog_burst_mode}, "
             f"input_backend={INPUT_BACKEND}, restore_cursor_after_click={RESTORE_CURSOR_AFTER_CLICK}, "
+            f"target_window_title={INPUT_TARGET_WINDOW_TITLE!r}, "
             f"stop_file={cfg.stop_file}"
         )
         print(
@@ -2311,6 +2396,7 @@ class LiveSession:
             cfg.stop_keys,
             cfg.stop_file,
             cfg.act,
+            max_total_clicks=(cfg.max_clicks - rt.click_count) if cfg.max_clicks > 0 else None,
         )
         rt.click_count += burst_clicks
         if burst_clicks > 0:
@@ -2425,6 +2511,11 @@ def main() -> None:
         default=RESTORE_CURSOR_AFTER_CLICK,
         help="Move the cursor back to its previous position after sendinput clicks.",
     )
+    parser.add_argument(
+        "--target-window-title",
+        default=INPUT_TARGET_WINDOW_TITLE,
+        help="Prefer a visible window whose title contains this text for postmessage clicks.",
+    )
     parser.add_argument("--monitor", type=int, default=1, help="monitor index. 1 is primary on this machine; 2 is the secondary display.")
     parser.add_argument(
         "--capture-method",
@@ -2458,6 +2549,7 @@ def main() -> None:
     args = parser.parse_args()
     globals()["INPUT_BACKEND"] = args.input_backend
     globals()["RESTORE_CURSOR_AFTER_CLICK"] = args.restore_cursor_after_click
+    globals()["INPUT_TARGET_WINDOW_TITLE"] = args.target_window_title.strip()
 
     log_path = None
     if not args.no_run_log:

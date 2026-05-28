@@ -5,7 +5,8 @@ import argparse
 import os
 from ctypes import wintypes
 
-from czn_detector import describe_window_at, set_dpi_awareness, window_at
+import czn_detector
+from czn_detector import describe_window_at, message_target_at, set_dpi_awareness, window_at
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -127,10 +128,16 @@ def window_title(hwnd: int) -> str:
     return title.value
 
 
-def probe_candidate(label: str, hwnd: int, x: int, y: int, activate: bool) -> None:
+def probe_candidate(label: str, hwnd: int, x: int, y: int, activate: bool, dry_run: bool) -> None:
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     print(f"[{label}] hwnd=0x{hwnd:x} pid={pid.value} title={window_title(hwnd)!r}")
+    client = POINT(x, y)
+    user32.ScreenToClient(hwnd, ctypes.byref(client))
+    print(f"client_point=({client.x},{client.y})")
+    if dry_run:
+        print("dry_run=true; no mouse messages sent")
+        return
     if activate:
         ctypes.set_last_error(0)
         ok = user32.PostMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
@@ -144,9 +151,16 @@ def main() -> None:
     parser.add_argument("--x", type=int, default=3590, help="Screen x coordinate to click/probe.")
     parser.add_argument("--y", type=int, default=1885, help="Screen y coordinate to click/probe.")
     parser.add_argument("--activate", action="store_true", help="Also send WM_ACTIVATE before mouse messages.")
+    parser.add_argument(
+        "--target-window-title",
+        default="",
+        help="Prefer a visible window whose title contains this text.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Resolve targets without sending mouse messages.")
     args = parser.parse_args()
 
     set_dpi_awareness()
+    czn_detector.INPUT_TARGET_WINDOW_TITLE = args.target_window_title.strip()
     x, y = args.x, args.y
     hwnd = window_at(x, y)
     pid = wintypes.DWORD()
@@ -159,8 +173,15 @@ def main() -> None:
     print(f"target_at=({x},{y}) {describe_window_at(x, y)}")
     print(f"target_integrity={integrity_name(target_rid)} status={target_status}")
     print(f"foreground={foreground_info()}")
-    for label, target in target_candidates(hwnd):
-        probe_candidate(label, target, x, y, args.activate)
+    if czn_detector.INPUT_TARGET_WINDOW_TITLE:
+        target = message_target_at(x, y)
+        if target:
+            probe_candidate("configured_title", target, x, y, args.activate, args.dry_run)
+        else:
+            print(f"configured_title target not found: {czn_detector.INPUT_TARGET_WINDOW_TITLE!r}")
+    else:
+        for label, target in target_candidates(hwnd):
+            probe_candidate(label, target, x, y, args.activate, args.dry_run)
 
 
 if __name__ == "__main__":
