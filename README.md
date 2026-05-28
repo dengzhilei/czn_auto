@@ -51,6 +51,7 @@ CZNAuto-portable.zip
 - 建议游戏使用全屏或无边框全屏。
 - 建议先用默认配置跑一次，不要一开始就改配置。
 - 正常启动默认使用后台窗口点击，通常不会移动或占用你的真实鼠标。
+- 窗口模式也可以尝试使用；程序会按游戏窗口客户区计算固定点击位置。窗口不要被其他窗口遮住。
 - 程序运行时仍会自动操作游戏窗口，请确保当前画面就是你想自动操作的游戏画面。
 - 找到目标卡后程序会自动停止。
 - 如果运行不正常，请把日志文件和出问题时的截图一起发到群里。
@@ -414,6 +415,7 @@ CONFIG.md                配置字段说明
 installer\czn_auto.iss   Inno Setup 安装包脚本
 czn_auto.spec            PyInstaller 打包配置
 build_release.bat        本地打包脚本
+RELEASE.md               发布和打包规范
 start_*_admin.bat        开发环境正式启动脚本
 start_*_exe.bat          发布包正式启动脚本
 run_*_admin.bat          其他开发环境运行脚本

@@ -6,7 +6,7 @@ import os
 from ctypes import wintypes
 
 import czn_detector
-from czn_detector import describe_window_at, message_target_at, set_dpi_awareness, window_at
+from czn_detector import click_area_for, describe_window_at, message_target_at, set_dpi_awareness, window_at
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -97,6 +97,20 @@ def foreground_info() -> str:
     return f"hwnd=0x{hwnd:x} pid={pid.value} title={title.value!r}"
 
 
+def monitor_for_point(x: int, y: int) -> dict:
+    import mss
+
+    mss_cls = getattr(mss, "MSS", None) or getattr(mss, "mss")
+    with mss_cls() as sct:
+        for monitor in sct.monitors[1:]:
+            if (
+                monitor["left"] <= x < monitor["left"] + monitor["width"]
+                and monitor["top"] <= y < monitor["top"] + monitor["height"]
+            ):
+                return dict(monitor)
+        return dict(sct.monitors[0])
+
+
 def post_message_probe(hwnd: int, x: int, y: int) -> list[str]:
     client = POINT(x, y)
     user32.ScreenToClient(hwnd, ctypes.byref(client))
@@ -173,6 +187,7 @@ def main() -> None:
     print(f"target_at=({x},{y}) {describe_window_at(x, y)}")
     print(f"target_integrity={integrity_name(target_rid)} status={target_status}")
     print(f"foreground={foreground_info()}")
+    print(f"click_area={click_area_for(monitor_for_point(x, y))}")
     if czn_detector.INPUT_TARGET_WINDOW_TITLE:
         target = message_target_at(x, y)
         if target:

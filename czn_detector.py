@@ -1637,6 +1637,43 @@ def _window_contains_point(hwnd: int, x: int, y: int) -> bool:
     return rect.left <= x < rect.right and rect.top <= y < rect.bottom
 
 
+def _client_area_on_screen(hwnd: int) -> dict | None:
+    user32 = ctypes.windll.user32
+    if not hwnd or not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
+        return None
+    rect = wintypes.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
+    origin = Point(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+        return None
+    width = int(rect.right - rect.left)
+    height = int(rect.bottom - rect.top)
+    if width <= 0 or height <= 0:
+        return None
+    return {
+        "left": int(origin.x),
+        "top": int(origin.y),
+        "width": width,
+        "height": height,
+        "source": "target_window_client",
+        "hwnd": int(hwnd),
+        "title": _window_title(hwnd),
+    }
+
+
+def _area_intersects_monitor(area: dict, monitor: dict) -> bool:
+    left = int(area["left"])
+    top = int(area["top"])
+    right = left + int(area["width"])
+    bottom = top + int(area["height"])
+    mon_left = int(monitor["left"])
+    mon_top = int(monitor["top"])
+    mon_right = mon_left + int(monitor["width"])
+    mon_bottom = mon_top + int(monitor["height"])
+    return left < mon_right and right > mon_left and top < mon_bottom and bottom > mon_top
+
+
 def _find_window_by_title_at_point(title_part: str, x: int, y: int) -> int:
     needle = title_part.strip().lower()
     if not needle:
@@ -1651,6 +1688,29 @@ def _find_window_by_title_at_point(title_part: str, x: int, y: int) -> int:
             return True
         title = _window_title(hwnd).lower()
         if needle in title and _window_contains_point(hwnd, x, y):
+            found.value = int(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    return int(found.value or 0)
+
+
+def _find_window_by_title_on_monitor(title_part: str, monitor: dict) -> int:
+    needle = title_part.strip().lower()
+    if not needle:
+        return 0
+
+    user32 = ctypes.windll.user32
+    found = ctypes.c_void_p(0)
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_proc(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = _window_title(hwnd).lower()
+        area = _client_area_on_screen(hwnd)
+        if needle in title and area and _area_intersects_monitor(area, monitor):
             found.value = int(hwnd)
             return False
         return True
@@ -1675,6 +1735,41 @@ def _cached_title_window(title_part: str, x: int, y: int) -> int:
     hwnd = _find_window_by_title_at_point(title_part, x, y)
     _INPUT_TARGET_HWND_CACHE = hwnd
     return hwnd
+
+
+def _cached_title_window_on_monitor(title_part: str, monitor: dict) -> int:
+    global _INPUT_TARGET_HWND_CACHE
+    user32 = ctypes.windll.user32
+    hwnd = _INPUT_TARGET_HWND_CACHE
+    needle = title_part.strip().lower()
+    area = _client_area_on_screen(hwnd) if hwnd else None
+    if (
+        hwnd
+        and user32.IsWindow(hwnd)
+        and user32.IsWindowVisible(hwnd)
+        and needle in _window_title(hwnd).lower()
+        and area
+        and _area_intersects_monitor(area, monitor)
+    ):
+        return hwnd
+    hwnd = _find_window_by_title_on_monitor(title_part, monitor)
+    _INPUT_TARGET_HWND_CACHE = hwnd
+    return hwnd
+
+
+def click_area_for(monitor: dict) -> dict:
+    if INPUT_TARGET_WINDOW_TITLE:
+        hwnd = _cached_title_window_on_monitor(INPUT_TARGET_WINDOW_TITLE, monitor)
+        area = _client_area_on_screen(hwnd) if hwnd else None
+        if area:
+            return area
+    return {
+        "left": int(monitor["left"]),
+        "top": int(monitor["top"]),
+        "width": int(monitor["width"]),
+        "height": int(monitor["height"]),
+        "source": "monitor",
+    }
 
 
 def message_target_at(x: int, y: int) -> int:
@@ -1783,8 +1878,9 @@ def window_at(x: int, y: int) -> int:
 
 
 def click_norm(point: tuple[float, float], monitor: dict, duration: float = 0.08) -> None:
-    x = int(monitor["left"] + monitor["width"] * point[0])
-    y = int(monitor["top"] + monitor["height"] * point[1])
+    area = click_area_for(monitor)
+    x = int(area["left"] + area["width"] * point[0])
+    y = int(area["top"] + area["height"] * point[1])
     print(f"click screen=({x},{y}){click_log_suffix(x, y)}", flush=True)
     click_screen_xy(x, y, duration=duration)
 
@@ -1798,8 +1894,9 @@ def rapid_click_norm(
     stop_keys: list[str],
     stop_file: Path | None,
 ) -> int:
-    x = int(monitor["left"] + monitor["width"] * point[0])
-    y = int(monitor["top"] + monitor["height"] * point[1])
+    area = click_area_for(monitor)
+    x = int(area["left"] + area["width"] * point[0])
+    y = int(area["top"] + area["height"] * point[1])
     print(f"rapid click screen=({x},{y}) count={count}{click_log_suffix(x, y)}", flush=True)
     if INPUT_BACKEND in {INPUT_BACKEND_POSTMESSAGE, INPUT_BACKEND_POSTMESSAGE_ACTIVATE}:
         for sent in range(count):
