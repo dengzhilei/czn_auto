@@ -22,6 +22,7 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
+APP_VERSION = "0.1.3"
 _DXGI_CAMERAS: dict[int, object] = {}
 _RUN_LOG_HANDLE = None
 _RUN_LOG_STDOUT = None
@@ -45,6 +46,8 @@ CAPTURE_METHODS = {
     CAPTURE_METHOD_DXGI,
     CAPTURE_METHOD_MSS,
 }
+DEFAULT_MONITOR = "auto"
+DEFAULT_CAPTURE_METHOD = CAPTURE_METHOD_AUTO
 
 WM_ACTIVATE = 0x0006
 WM_MOUSEMOVE = 0x0200
@@ -192,6 +195,7 @@ def json_safe_args(args: argparse.Namespace) -> str:
 def print_run_header(args: argparse.Namespace, log_path: Path | None) -> None:
     print("=" * 80)
     print(f"CZN Auto run started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"app_version={APP_VERSION}")
     print(f"log_file={log_path if log_path else 'disabled/unavailable'}")
     print(f"cwd={Path.cwd()}")
     print(f"app_base={app_base_dir()}")
@@ -494,6 +498,8 @@ LOG_CLICK_WINDOW = False
 INPUT_BACKEND = INPUT_BACKEND_POSTMESSAGE_ACTIVATE
 RESTORE_CURSOR_AFTER_CLICK = False
 INPUT_TARGET_WINDOW_TITLE = "卡厄思梦境"
+MONITOR_INDEX = DEFAULT_MONITOR
+CAPTURE_METHOD = DEFAULT_CAPTURE_METHOD
 _INPUT_TARGET_HWND_CACHE = 0
 
 # 识别等待轮询间隔，用在等待“脱逃页/确认弹窗/回首页”等关键状态。
@@ -602,6 +608,10 @@ CONFIG_BINDINGS = {
         "restore_cursor_after_click": ("RESTORE_CURSOR_AFTER_CLICK", "bool"),
         "target_window_title": ("INPUT_TARGET_WINDOW_TITLE", "string"),
     },
+    "runtime": {
+        "monitor": ("MONITOR_INDEX", "monitor"),
+        "capture_method": ("CAPTURE_METHOD", "capture_method"),
+    },
 }
 
 
@@ -675,6 +685,11 @@ def default_user_config() -> dict:
             "restore_cursor_after_click": RESTORE_CURSOR_AFTER_CLICK,
             "target_window_title": INPUT_TARGET_WINDOW_TITLE,
         },
+        "runtime": {
+            "_说明": "运行环境。monitor 默认 auto，会按 target_window_title 自动选择游戏所在屏幕；capture_method 默认 auto，优先使用更适合多屏/窗口模式的 mss。",
+            "monitor": MONITOR_INDEX,
+            "capture_method": CAPTURE_METHOD,
+        },
     }
 
 
@@ -728,6 +743,26 @@ def _coerce_config_value(value: object, kind: str, label: str) -> object:
         if text not in INPUT_BACKENDS:
             raise ValueError(f"{label} must be one of {', '.join(sorted(INPUT_BACKENDS))}")
         return text
+    if kind == "capture_method":
+        text = str(value).strip().lower().replace("-", "_")
+        if text not in CAPTURE_METHODS:
+            raise ValueError(f"{label} must be one of {', '.join(sorted(CAPTURE_METHODS))}")
+        return text
+    if kind == "monitor":
+        if isinstance(value, int):
+            if value < 0:
+                raise ValueError(f"{label} must be auto or a monitor index >= 0")
+            return value
+        text = str(value).strip().lower()
+        if text in {"auto", "target", "window"}:
+            return "auto"
+        try:
+            index = int(text)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be auto or a monitor index") from exc
+        if index < 0:
+            raise ValueError(f"{label} must be auto or a monitor index >= 0")
+        return index
     if kind == "bool":
         if isinstance(value, bool):
             return value
@@ -1138,6 +1173,14 @@ def _monitor_meta(monitor_index: int) -> dict:
     return monitor
 
 
+def _available_monitors() -> list[dict]:
+    import mss
+
+    mss_cls = getattr(mss, "MSS", None) or getattr(mss, "mss")
+    with mss_cls() as sct:
+        return [dict(monitor) for monitor in sct.monitors]
+
+
 def _screen_shot_mss(monitor_index: int) -> tuple[np.ndarray, dict]:
     import mss
 
@@ -1174,15 +1217,82 @@ def _screen_shot_dxgi(monitor_index: int) -> tuple[np.ndarray, dict]:
     return frame.copy(), _monitor_meta(monitor_index)
 
 
-def screen_shot(monitor_index: int, capture_method: str = CAPTURE_METHOD_DXGI) -> tuple[np.ndarray, dict]:
-    if capture_method in {CAPTURE_METHOD_AUTO, CAPTURE_METHOD_DXGI}:
+def _target_capture_area_on_monitor(monitor: dict) -> dict | None:
+    if not INPUT_TARGET_WINDOW_TITLE:
+        return None
+    hwnd = _cached_title_window_on_monitor(INPUT_TARGET_WINDOW_TITLE, monitor)
+    area = _client_area_on_screen(hwnd) if hwnd else None
+    if area and _area_intersects_monitor(area, monitor):
+        return area
+    return None
+
+
+def _crop_frame_to_area(frame: np.ndarray, monitor: dict, area: dict) -> tuple[np.ndarray, dict]:
+    mon_left = int(monitor["left"])
+    mon_top = int(monitor["top"])
+    mon_right = mon_left + int(monitor["width"])
+    mon_bottom = mon_top + int(monitor["height"])
+
+    area_left = int(area["left"])
+    area_top = int(area["top"])
+    area_right = area_left + int(area["width"])
+    area_bottom = area_top + int(area["height"])
+
+    left = max(mon_left, area_left)
+    top = max(mon_top, area_top)
+    right = min(mon_right, area_right)
+    bottom = min(mon_bottom, area_bottom)
+    if right <= left or bottom <= top:
+        return frame, monitor
+
+    x1 = max(0, left - mon_left)
+    y1 = max(0, top - mon_top)
+    x2 = min(frame.shape[1], right - mon_left)
+    y2 = min(frame.shape[0], bottom - mon_top)
+    if x2 <= x1 or y2 <= y1:
+        return frame, monitor
+
+    cropped_monitor = dict(area)
+    cropped_monitor.update(
+        {
+            "left": left,
+            "top": top,
+            "width": x2 - x1,
+            "height": y2 - y1,
+            "source": "target_window_client_capture",
+            "capture_monitor": dict(monitor),
+        }
+    )
+    return frame[y1:y2, x1:x2].copy(), cropped_monitor
+
+
+def _apply_target_window_crop(frame: np.ndarray, monitor: dict) -> tuple[np.ndarray, dict]:
+    area = _target_capture_area_on_monitor(monitor)
+    if not area:
+        return frame, monitor
+    return _crop_frame_to_area(frame, monitor, area)
+
+
+def screen_shot(monitor_index: int, capture_method: str = DEFAULT_CAPTURE_METHOD) -> tuple[np.ndarray, dict]:
+    if capture_method == CAPTURE_METHOD_AUTO:
         try:
-            return _screen_shot_dxgi(monitor_index)
+            frame, monitor = _screen_shot_mss(monitor_index)
+            return _apply_target_window_crop(frame, monitor)
+        except Exception as exc:
+            print(f"MSS capture failed, falling back to dxgi: {exc}", flush=True)
+            frame, monitor = _screen_shot_dxgi(monitor_index)
+            return _apply_target_window_crop(frame, monitor)
+    if capture_method == CAPTURE_METHOD_DXGI:
+        try:
+            frame, monitor = _screen_shot_dxgi(monitor_index)
+            return _apply_target_window_crop(frame, monitor)
         except Exception as exc:
             print(f"DXGI capture failed, falling back to mss: {exc}", flush=True)
-            return _screen_shot_mss(monitor_index)
+            frame, monitor = _screen_shot_mss(monitor_index)
+            return _apply_target_window_crop(frame, monitor)
     if capture_method == CAPTURE_METHOD_MSS:
-        return _screen_shot_mss(monitor_index)
+        frame, monitor = _screen_shot_mss(monitor_index)
+        return _apply_target_window_crop(frame, monitor)
     raise ValueError(f"unknown capture method: {capture_method}")
 
 
@@ -1770,6 +1880,39 @@ def click_area_for(monitor: dict) -> dict:
         "height": int(monitor["height"]),
         "source": "monitor",
     }
+
+
+def resolve_monitor_index(monitor_value: object) -> int:
+    normalized = _coerce_config_value(monitor_value, "monitor", "runtime.monitor")
+    monitors = _available_monitors()
+    if normalized != "auto":
+        index = int(normalized)
+        if index >= len(monitors):
+            raise ValueError(f"monitor index {index} is out of range; available: 0..{len(monitors) - 1}")
+        CONFIG_MESSAGES.append(f"runtime monitor: using configured monitor {index}")
+        return index
+
+    if INPUT_TARGET_WINDOW_TITLE:
+        for index, monitor in enumerate(monitors[1:], start=1):
+            hwnd = _find_window_by_title_on_monitor(INPUT_TARGET_WINDOW_TITLE, monitor)
+            area = _client_area_on_screen(hwnd) if hwnd else None
+            if area:
+                CONFIG_MESSAGES.append(
+                    "runtime monitor: auto selected monitor "
+                    f"{index} for target_window_title={INPUT_TARGET_WINDOW_TITLE!r}, "
+                    f"hwnd={int(hwnd)}, area={area}"
+                )
+                return index
+        CONFIG_MESSAGES.append(
+            "runtime monitor: auto could not find target window "
+            f"{INPUT_TARGET_WINDOW_TITLE!r}; falling back to primary monitor 1"
+        )
+    else:
+        CONFIG_MESSAGES.append("runtime monitor: auto has no target_window_title; falling back to primary monitor 1")
+
+    if len(monitors) > 1:
+        return 1
+    return 0
 
 
 def message_target_at(x: int, y: int) -> int:
@@ -2613,12 +2756,16 @@ def main() -> None:
         default=INPUT_TARGET_WINDOW_TITLE,
         help="Prefer a visible window whose title contains this text for postmessage clicks.",
     )
-    parser.add_argument("--monitor", type=int, default=1, help="monitor index. 1 is primary on this machine; 2 is the secondary display.")
+    parser.add_argument(
+        "--monitor",
+        default=MONITOR_INDEX,
+        help="monitor index, or auto to use the target game window. Defaults to runtime.monitor in config.",
+    )
     parser.add_argument(
         "--capture-method",
         choices=sorted(CAPTURE_METHODS),
-        default=CAPTURE_METHOD_DXGI,
-        help="Live screenshot backend. auto/dxgi try DXGI first and fall back to mss; mss forces the older backend.",
+        default=CAPTURE_METHOD,
+        help="Live screenshot backend. auto prefers reliable mss capture; dxgi forces the faster DXGI backend.",
     )
     parser.add_argument("--advance-on-unknown", action="store_true", help="Allow live mode to click the advance point when no known UI state is detected.")
     parser.add_argument(
@@ -2651,6 +2798,10 @@ def main() -> None:
     log_path = None
     if not args.no_run_log:
         log_path = setup_run_log(args.log_file)
+    try:
+        args.monitor = resolve_monitor_index(args.monitor)
+    except Exception as exc:
+        parser.error(str(exc))
     print_run_header(args, log_path)
 
     detector = CznDetector(wide_match_scales=args.wide_match_scales)

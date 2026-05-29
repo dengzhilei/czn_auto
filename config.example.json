@@ -66,5 +66,10 @@
     "backend": "postmessage_activate",
     "restore_cursor_after_click": false,
     "target_window_title": "卡厄思梦境"
+  },
+  "runtime": {
+    "_说明": "运行环境。monitor 默认 auto，会按 target_window_title 自动选择游戏所在屏幕；capture_method 默认 auto，优先使用更适合多屏/窗口模式的 mss。",
+    "monitor": "auto",
+    "capture_method": "auto"
   }
 }

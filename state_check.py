@@ -3,14 +3,25 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from czn_detector import CznDetector, annotate, print_state, save_image, screen_shot
+from czn_detector import (
+    CAPTURE_METHODS,
+    DEFAULT_CAPTURE_METHOD,
+    MONITOR_INDEX,
+    CznDetector,
+    annotate,
+    print_state,
+    resolve_monitor_index,
+    save_image,
+    screen_shot,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Capture one fresh frame and classify the current CZN state.")
-    parser.add_argument("--monitor", type=int, default=1)
-    parser.add_argument("--capture-method", choices=["dxgi", "mss"], default="dxgi")
+    parser.add_argument("--monitor", default=MONITOR_INDEX)
+    parser.add_argument("--capture-method", choices=sorted(CAPTURE_METHODS), default=DEFAULT_CAPTURE_METHOD)
     args = parser.parse_args()
+    args.monitor = resolve_monitor_index(args.monitor)
 
     root = Path(__file__).resolve().parent
     frame, monitor = screen_shot(args.monitor, args.capture_method)
