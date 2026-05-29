@@ -23,6 +23,7 @@
     "post_click_wait": 4.0,
     "wait_after_team_enter": 7.0,
     "reward_settle_before_action": 1.5,
+    "choice_settle_before_action": 0.35,
     "start_to_team_burst_taps": 1,
     "start_to_team_tap_delay": 0.5,
     "dialog_burst_max_taps": 9,

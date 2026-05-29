@@ -22,7 +22,7 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 _DXGI_CAMERAS: dict[int, object] = {}
 _FORCED_CAPTURE_AREAS: dict[int, dict] = {}
 _RUN_LOG_HANDLE = None
@@ -256,6 +256,7 @@ def runtime_timing_profile() -> dict:
         "start_to_team_burst_taps": START_TO_TEAM_BURST_TAPS,
         "start_to_team_tap_delay": START_TO_TEAM_TAP_DELAY,
         "reward_settle_before_action": REWARD_SETTLE_BEFORE_ACTION,
+        "choice_settle_before_action": CHOICE_SETTLE_BEFORE_ACTION,
         "chain_menu_to_flee_delay": CHAIN_MENU_TO_FLEE_DELAY,
         "chain_flee_to_confirm_delay": CHAIN_FLEE_TO_CONFIRM_DELAY,
         "chain_menu_to_flee_timeout": CHAIN_MENU_TO_FLEE_TIMEOUT,
@@ -378,6 +379,7 @@ class DetectionState:
     top_right_menu: MatchResult | None
     flee_button: MatchResult | None
     team_enter: MatchResult | None
+    dialog_indicator: MatchResult | None
 
     @property
     def label(self) -> str:
@@ -410,6 +412,7 @@ def detection_state(
     top_right_menu: MatchResult | None = None,
     flee_button: MatchResult | None = None,
     team_enter: MatchResult | None = None,
+    dialog_indicator: MatchResult | None = None,
 ) -> DetectionState:
     return DetectionState(
         legend_choice=legend_choice,
@@ -421,6 +424,7 @@ def detection_state(
         top_right_menu=top_right_menu,
         flee_button=flee_button,
         team_enter=team_enter,
+        dialog_indicator=dialog_indicator,
     )
 
 
@@ -516,6 +520,7 @@ VISUAL_CHANGE_POLL_INTERVAL = 0.20
 
 # 传说选项：点选项卡后，等对勾出现/可点的短暂停顿。
 LEGEND_CONFIRM_DELAY = 0.20
+CHOICE_SETTLE_BEFORE_ACTION = 0.35
 
 # 点击函数内部固定耗时。一次点击大约是：
 # CLICK_MOVE_DELAY + CLICK_ABSOLUTE_MOVE_DELAY + duration + CLICK_AFTER_UP_DELAY。
@@ -566,6 +571,7 @@ CONFIG_BINDINGS = {
         "post_click_wait": ("POST_CLICK_WAIT", "nonnegative_float"),
         "wait_after_team_enter": ("WAIT_AFTER_TEAM_ENTER_BEFORE_DIALOG", "nonnegative_float"),
         "reward_settle_before_action": ("REWARD_SETTLE_BEFORE_ACTION", "nonnegative_float"),
+        "choice_settle_before_action": ("CHOICE_SETTLE_BEFORE_ACTION", "nonnegative_float"),
         "start_to_team_burst_taps": ("START_TO_TEAM_BURST_TAPS", "nonnegative_int"),
         "start_to_team_tap_delay": ("START_TO_TEAM_TAP_DELAY", "nonnegative_float"),
         "dialog_burst_max_taps": ("DIALOG_BURST_MAX_TAPS", "nonnegative_int"),
@@ -642,6 +648,7 @@ def default_user_config() -> dict:
             "post_click_wait": POST_CLICK_WAIT,
             "wait_after_team_enter": WAIT_AFTER_TEAM_ENTER_BEFORE_DIALOG,
             "reward_settle_before_action": REWARD_SETTLE_BEFORE_ACTION,
+            "choice_settle_before_action": CHOICE_SETTLE_BEFORE_ACTION,
             "start_to_team_burst_taps": START_TO_TEAM_BURST_TAPS,
             "start_to_team_tap_delay": START_TO_TEAM_TAP_DELAY,
             "dialog_burst_max_taps": DIALOG_BURST_MAX_TAPS,
@@ -914,20 +921,6 @@ class CznDetector:
         if legend:
             return detection_state(legend_choice=legend)
 
-        choice_card = self._detect_choice_anchors(frame_gray)
-        if choice_card:
-            return detection_state(choice_card=choice_card)
-
-        flee_button = self._match_in_roi(
-            frame_gray,
-            self.flee_button_template,
-            Box(0.70, 0.82, 0.995, 0.995),
-            "flee_button",
-            threshold=0.72,
-        )
-        if flee_button:
-            return detection_state(flee_button=flee_button)
-
         team_enter = self._match_in_roi(
             frame_gray,
             self.team_enter_template,
@@ -945,9 +938,34 @@ class CznDetector:
             "start_enter_button",
             threshold=0.72,
         )
-        return detection_state(start_screen=start_screen)
+        if start_screen:
+            return detection_state(start_screen=start_screen)
 
-    def _detect_choice_anchors(self, frame_gray: np.ndarray) -> MatchResult | None:
+        choice_card = self._detect_choice_anchors(frame_gray, allow_layout=False)
+        if choice_card:
+            return detection_state(choice_card=choice_card)
+
+        dialog_indicator = self._detect_dialog_indicator(frame_gray)
+        if dialog_indicator:
+            return detection_state(dialog_indicator=dialog_indicator)
+
+        choice_card = self._detect_choice_anchors(frame_gray, allow_layout=True)
+        if choice_card:
+            return detection_state(choice_card=choice_card)
+
+        flee_button = self._match_in_roi(
+            frame_gray,
+            self.flee_button_template,
+            Box(0.70, 0.82, 0.995, 0.995),
+            "flee_button",
+            threshold=0.72,
+        )
+        if flee_button:
+            return detection_state(flee_button=flee_button)
+
+        return detection_state()
+
+    def _detect_choice_anchors(self, frame_gray: np.ndarray, allow_layout: bool = True) -> MatchResult | None:
         h, w = frame_gray.shape[:2]
         glow_rois = [
             Box(0.12, 0.74, 0.38, 0.998),
@@ -973,7 +991,49 @@ class CznDetector:
             score = min(match.score for match in matches)
             return MatchResult("choice_glows", score, (x1, y1, x2, y2))
 
+        if not allow_layout:
+            return None
         return self._detect_choice_panel_layout(frame_gray)
+
+    def _detect_dialog_indicator(self, frame_gray: np.ndarray) -> MatchResult | None:
+        height, width = frame_gray.shape[:2]
+        roi = Box(0.90, 0.72, 0.995, 0.985)
+        x1, y1, x2, y2 = roi.to_pixels(width, height)
+        crop = frame_gray[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+
+        min_w = max(10, width * 0.006)
+        max_w = max(28, width * 0.075)
+        min_h = max(8, height * 0.006)
+        max_h = max(24, height * 0.075)
+        best: MatchResult | None = None
+        for threshold in (140, 165, 190, 215):
+            _, bright = cv2.threshold(crop, threshold, 255, cv2.THRESH_BINARY)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, kernel, iterations=1)
+            contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                bx, by, bw, bh = cv2.boundingRect(contour)
+                if not (min_w <= bw <= max_w and min_h <= bh <= max_h):
+                    continue
+                abs_cx = x1 + bx + bw / 2.0
+                abs_cy = y1 + by + bh / 2.0
+                if abs_cx < width * 0.90 or abs_cy < height * 0.78 or abs_cy > height * 0.94:
+                    continue
+                area = cv2.contourArea(contour)
+                fill = area / max(1.0, bw * bh)
+                if fill < 0.04:
+                    continue
+                approx = cv2.approxPolyDP(contour, max(2.0, 0.05 * cv2.arcLength(contour, True)), True)
+                if not (3 <= len(approx) <= 8):
+                    continue
+
+                score = min(0.99, 0.45 + fill + (215 - threshold) / 500.0)
+                match = MatchResult("dialog_indicator", score, (x1 + bx, y1 + by, x1 + bx + bw, y1 + by + bh))
+                if best is None or match.score > best.score:
+                    best = match
+        return best
 
     def _detect_choice_panel_layout(self, frame_gray: np.ndarray) -> MatchResult | None:
         height, width = frame_gray.shape[:2]
@@ -1174,6 +1234,7 @@ def annotate(frame: np.ndarray, state: DetectionState) -> np.ndarray:
         (state.top_right_menu, (255, 120, 255)),
         (state.flee_button, (0, 140, 255)),
         (state.team_enter, (120, 255, 120)),
+        (state.dialog_indicator, (255, 255, 120)),
         (state.card_reward, (255, 255, 255)),
         (state.dream_card, (0, 255, 0)),
     ):
@@ -1235,6 +1296,8 @@ def print_state(prefix: str, state: DetectionState) -> None:
         parts.append(f"flee={state.flee_button.score:.3f}@{state.flee_button.center}")
     if state.team_enter:
         parts.append(f"team={state.team_enter.score:.3f}@{state.team_enter.center}")
+    if state.dialog_indicator:
+        parts.append(f"dialog={state.dialog_indicator.score:.3f}@{state.dialog_indicator.center}")
     if state.card_reward:
         parts.append(f"reward={state.card_reward.score:.3f}@{state.card_reward.center}")
     if state.dream_card:
@@ -1689,6 +1752,18 @@ def fast_abandon_no_legend(
 ) -> int:
     clicks = 0
     state = detector.detect(frame)
+    if state.label in {"start_screen", "team_screen"} or state.dialog_indicator:
+        print(f"no legend chain skipped: current state is {state.label}; not clicking top-right menu.")
+        return 0
+    if not state.choice_card:
+        print("no legend chain skipped: choice screen is not confirmed; not clicking top-right menu.")
+        return 0
+    if state.choice_card.name != "choice_glows":
+        print(
+            "no legend chain skipped: choice screen only matched structural fallback "
+            f"({state.choice_card.name}); not clicking top-right menu."
+        )
+        return 0
     retry_point = state.top_right_menu.center if state.top_right_menu else None
     print_action("no legend chain: click top-right menu", CLICK_RETRY_TOP_RIGHT, act)
     if act:
@@ -2668,7 +2743,7 @@ class LiveSession:
         if state.legend_choice:
             return self.handle_legend_choice(frame, monitor, state, now)
         if state.choice_card:
-            return self.handle_choice_screen(frame, monitor, now)
+            return self.handle_choice_screen(frame, monitor, state, now)
         if state.flee_button:
             return self.handle_flee_screen(frame, monitor, state, now)
         if state.team_enter:
@@ -2677,7 +2752,7 @@ class LiveSession:
             return self.handle_team_enter_fallback(monitor, state, now)
         if state.start_screen:
             return self.handle_start_screen(frame, monitor, state, now)
-        return self.handle_unknown(monitor, now)
+        return self.handle_unknown(monitor, state, now)
 
     def handle_dream_card(self) -> bool:
         self.disarm_dialog()
@@ -2776,7 +2851,7 @@ class LiveSession:
         self.mark_action(now, DELAY_AFTER_LEGEND_CONFIRM)
         return True
 
-    def handle_choice_screen(self, frame: np.ndarray, monitor: dict, now: float) -> bool:
+    def handle_choice_screen(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
         cfg = self.config
         rt = self.runtime
         self.reset_common(reward=True, choice=False, start=True, dialog=True)
@@ -2784,6 +2859,19 @@ class LiveSession:
             print("choice screen without legend already handled once; waiting for screen to change.")
             self.mark_action(now, DELAY_CHOICE_ALREADY_HANDLED)
             return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
+        if CHOICE_SETTLE_BEFORE_ACTION > 0:
+            print(f"choice screen: settle {CHOICE_SETTLE_BEFORE_ACTION:.1f}s before treating it as no-legend.")
+            if sleep_interruptible(CHOICE_SETTLE_BEFORE_ACTION, cfg.stop_keys, cfg.stop_file):
+                return False
+            frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method)
+            settled_state = cfg.detector.detect(frame)
+            print_state("choice settle", settled_state)
+            if settled_state.legend_choice:
+                return self.handle_legend_choice(frame, monitor, settled_state, time.time())
+            if settled_state.label != "choice_screen":
+                print(f"choice screen changed during settle: handling {settled_state.label} instead.")
+                return self.handle_state(frame, monitor, settled_state, time.time())
+
         chain_clicks = fast_abandon_no_legend(
             cfg.detector,
             frame,
@@ -2900,15 +2988,16 @@ class LiveSession:
         self.mark_action(now, DELAY_AFTER_START_ENTER)
         return True
 
-    def handle_unknown(self, monitor: dict, now: float) -> bool:
+    def handle_unknown(self, monitor: dict, state: DetectionState, now: float) -> bool:
         cfg = self.config
         rt = self.runtime
         self.reset_common(dialog=False)
-        if not cfg.advance_on_unknown:
+        dialog_detected = state.dialog_indicator is not None
+        if not cfg.advance_on_unknown and not dialog_detected:
             print("unknown screen: no click. Pass --advance-on-unknown to enable blind advance clicks.")
             self.mark_action(now, DELAY_UNKNOWN_IDLE)
             return True
-        if not rt.dialog_advance_armed:
+        if not rt.dialog_advance_armed and not dialog_detected:
             print("unknown screen: dialog advance is not armed; waiting for a team enter first.")
             self.mark_action(now, DELAY_UNKNOWN_IDLE)
             return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
@@ -2918,6 +3007,8 @@ class LiveSession:
             self.mark_action(now, min(max(remaining, cfg.interval), 1.0))
             return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
         rt.wait_for_dialog_until = 0.0
+        if dialog_detected and not rt.dialog_advance_armed:
+            print(f"unknown screen: dialog indicator detected at {state.dialog_indicator.center}; advancing once.")
         burst_clicks = fast_advance_unknown(
             cfg.detector,
             monitor,
@@ -2926,6 +3017,8 @@ class LiveSession:
             cfg.stop_keys,
             cfg.stop_file,
             cfg.act,
+            max_taps=1 if dialog_detected and not rt.dialog_advance_armed else DIALOG_BURST_MAX_TAPS,
+            mode="checked" if dialog_detected and not rt.dialog_advance_armed else DIALOG_BURST_MODE,
             max_total_clicks=(cfg.max_clicks - rt.click_count) if cfg.max_clicks > 0 else None,
         )
         rt.click_count += burst_clicks

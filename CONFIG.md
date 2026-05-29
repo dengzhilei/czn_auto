@@ -33,13 +33,15 @@ templates\
 - `timing.wait_after_team_enter`：点配队进入后，加载慢、对白还没出来就开始点时，加大这个。
 - `timing.post_click_wait`：点击后等待下一步界面变化的通用时间。
 - `timing.reward_settle_before_action`：卡牌奖励页出现后，识别太急或立刻退出时，加大这个。
+- `timing.choice_settle_before_action`：第一阶段三选一出现后，先短等多久再判断是否没有传说；通常不用加太大。
 
 机器慢，可以先试：
 
 ```json
 "wait_after_team_enter": 8.0,
 "post_click_wait": 5.0,
-"reward_settle_before_action": 2.0
+"reward_settle_before_action": 2.0,
+"choice_settle_before_action": 0.35
 ```
 
 ## click_points 字段
@@ -68,6 +70,7 @@ templates\
 - `post_click_wait`：点击后等待画面变化的通用时间。网络或机器慢可以加大。
 - `wait_after_team_enter`：点配队页进入后，等待加载/对白出现的时间。加载慢最优先调这个。
 - `reward_settle_before_action`：识别到卡牌奖励页后，先停留多久再判断有没有目标卡、是否退出。
+- `choice_settle_before_action`：第一阶段三选一还没识别到传说时，先短暂停留多久再按无传说处理。
 - `start_to_team_burst_taps`：主页到配队页的快速点击次数。现在默认 1，通常不要加大。
 - `start_to_team_tap_delay`：主页快速点击之间的间隔。
 - `dialog_burst_max_taps`：对白 rapid 连点最多点几下。
