@@ -22,8 +22,9 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.5"
 _DXGI_CAMERAS: dict[int, object] = {}
+_FORCED_CAPTURE_AREAS: dict[int, dict] = {}
 _RUN_LOG_HANDLE = None
 _RUN_LOG_STDOUT = None
 _RUN_LOG_STDERR = None
@@ -859,10 +860,11 @@ class CznDetector:
             raise FileNotFoundError(f"template not found or unreadable: {path}")
         return image
 
-    def detect(self, frame_bgr: np.ndarray) -> DetectionState:
+    def detect(self, frame_bgr: np.ndarray, warn_aspect: bool = True) -> DetectionState:
         frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         h, w = frame_bgr.shape[:2]
-        self._warn_if_unexpected_aspect(w, h)
+        if warn_aspect:
+            self._warn_if_unexpected_aspect(w, h)
         dream = self._match_in_roi(
             frame_gray,
             self.dream_template,
@@ -1169,7 +1171,8 @@ def _monitor_meta(monitor_index: int) -> dict:
     with mss_cls() as sct:
         if monitor_index < 0 or monitor_index >= len(sct.monitors):
             raise ValueError(f"monitor index {monitor_index} is out of range; available: 0..{len(sct.monitors) - 1}")
-        monitor = sct.monitors[monitor_index]
+        monitor = dict(sct.monitors[monitor_index])
+        monitor["index"] = monitor_index
     return monitor
 
 
@@ -1178,7 +1181,12 @@ def _available_monitors() -> list[dict]:
 
     mss_cls = getattr(mss, "MSS", None) or getattr(mss, "mss")
     with mss_cls() as sct:
-        return [dict(monitor) for monitor in sct.monitors]
+        monitors = []
+        for index, monitor in enumerate(sct.monitors):
+            item = dict(monitor)
+            item["index"] = index
+            monitors.append(item)
+        return monitors
 
 
 def _screen_shot_mss(monitor_index: int) -> tuple[np.ndarray, dict]:
@@ -1188,8 +1196,10 @@ def _screen_shot_mss(monitor_index: int) -> tuple[np.ndarray, dict]:
     with mss_cls() as sct:
         if monitor_index < 0 or monitor_index >= len(sct.monitors):
             raise ValueError(f"monitor index {monitor_index} is out of range; available: 0..{len(sct.monitors) - 1}")
-        monitor = sct.monitors[monitor_index]
-        raw = np.array(sct.grab(monitor))
+        grab_monitor = sct.monitors[monitor_index]
+        monitor = dict(grab_monitor)
+        monitor["index"] = monitor_index
+        raw = np.array(sct.grab(grab_monitor))
     return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR), monitor
 
 
@@ -1222,7 +1232,7 @@ def _target_capture_area_on_monitor(monitor: dict) -> dict | None:
         return None
     hwnd = _cached_title_window_on_monitor(INPUT_TARGET_WINDOW_TITLE, monitor)
     area = _client_area_on_screen(hwnd) if hwnd else None
-    if area and _area_intersects_monitor(area, monitor):
+    if area and _area_monitor_intersection_ratio(area, monitor) >= 0.50:
         return area
     return None
 
@@ -1267,6 +1277,9 @@ def _crop_frame_to_area(frame: np.ndarray, monitor: dict, area: dict) -> tuple[n
 
 
 def _apply_target_window_crop(frame: np.ndarray, monitor: dict) -> tuple[np.ndarray, dict]:
+    forced_area = _FORCED_CAPTURE_AREAS.get(int(monitor.get("index", -1)))
+    if forced_area:
+        return _crop_frame_to_area(frame, monitor, forced_area)
     area = _target_capture_area_on_monitor(monitor)
     if not area:
         return frame, monitor
@@ -1784,6 +1797,21 @@ def _area_intersects_monitor(area: dict, monitor: dict) -> bool:
     return left < mon_right and right > mon_left and top < mon_bottom and bottom > mon_top
 
 
+def _area_monitor_intersection_ratio(area: dict, monitor: dict) -> float:
+    intersection = _window_area_intersection_score(area, monitor)
+    area_size = float(max(1, int(area.get("width", 0)) * int(area.get("height", 0))))
+    return intersection / area_size
+
+
+def _area_looks_like_game_window(area: dict) -> bool:
+    width = int(area.get("width", 0))
+    height = int(area.get("height", 0))
+    if width < 640 or height < 360:
+        return False
+    aspect = width / max(1, height)
+    return 1.15 <= aspect <= 2.25
+
+
 def _find_window_by_title_at_point(title_part: str, x: int, y: int) -> int:
     needle = title_part.strip().lower()
     if not needle:
@@ -1812,7 +1840,7 @@ def _find_window_by_title_on_monitor(title_part: str, monitor: dict) -> int:
         return 0
 
     user32 = ctypes.windll.user32
-    found = ctypes.c_void_p(0)
+    candidates: list[tuple[float, int]] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def enum_proc(hwnd: int, _lparam: int) -> bool:
@@ -1820,13 +1848,22 @@ def _find_window_by_title_on_monitor(title_part: str, monitor: dict) -> int:
             return True
         title = _window_title(hwnd).lower()
         area = _client_area_on_screen(hwnd)
-        if needle in title and area and _area_intersects_monitor(area, monitor):
-            found.value = int(hwnd)
-            return False
+        if (
+            needle in title
+            and area
+            and _area_monitor_intersection_ratio(area, monitor) >= 0.50
+            and _area_looks_like_game_window(area)
+        ):
+            aspect = int(area["width"]) / max(1, int(area["height"]))
+            score = _window_area_intersection_score(area, monitor) - abs(aspect - BASE_ASPECT) * 100_000
+            candidates.append((score, int(hwnd)))
         return True
 
     user32.EnumWindows(enum_proc, 0)
-    return int(found.value or 0)
+    if not candidates:
+        return 0
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 
 def _cached_title_window(title_part: str, x: int, y: int) -> int:
@@ -1859,7 +1896,8 @@ def _cached_title_window_on_monitor(title_part: str, monitor: dict) -> int:
         and user32.IsWindowVisible(hwnd)
         and needle in _window_title(hwnd).lower()
         and area
-        and _area_intersects_monitor(area, monitor)
+        and _area_monitor_intersection_ratio(area, monitor) >= 0.50
+        and _area_looks_like_game_window(area)
     ):
         return hwnd
     hwnd = _find_window_by_title_on_monitor(title_part, monitor)
@@ -1880,6 +1918,101 @@ def click_area_for(monitor: dict) -> dict:
         "height": int(monitor["height"]),
         "source": "monitor",
     }
+
+
+@dataclasses.dataclass
+class CaptureProbe:
+    monitor_index: int
+    area: dict
+    frame: np.ndarray
+    monitor: dict
+    state: DetectionState
+    score: float
+
+
+def _window_area_intersection_score(area: dict, monitor: dict) -> float:
+    left = max(int(area["left"]), int(monitor["left"]))
+    top = max(int(area["top"]), int(monitor["top"]))
+    right = min(int(area["left"]) + int(area["width"]), int(monitor["left"]) + int(monitor["width"]))
+    bottom = min(int(area["top"]) + int(area["height"]), int(monitor["top"]) + int(monitor["height"]))
+    if right <= left or bottom <= top:
+        return 0.0
+    return float((right - left) * (bottom - top))
+
+
+def _visible_game_window_candidates(monitor: dict) -> list[tuple[int, dict]]:
+    user32 = ctypes.windll.user32
+    candidates: list[tuple[int, dict]] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_proc(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return True
+        area = _client_area_on_screen(hwnd)
+        if not area or _area_monitor_intersection_ratio(area, monitor) < 0.50:
+            return True
+        if not _area_looks_like_game_window(area):
+            return True
+        area = dict(area)
+        area["hwnd"] = int(hwnd)
+        area["title"] = _window_title(hwnd)
+        candidates.append((int(hwnd), area))
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    candidates.sort(
+        key=lambda item: (
+            INPUT_TARGET_WINDOW_TITLE.strip().lower() in item[1].get("title", "").lower(),
+            _window_area_intersection_score(item[1], monitor),
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def probe_game_window_capture(detector: CznDetector, capture_method: str) -> CaptureProbe | None:
+    probes: list[CaptureProbe] = []
+    for monitor_index, monitor in enumerate(_available_monitors()[1:], start=1):
+        try:
+            base_frame, base_monitor = _screen_shot_mss(monitor_index)
+        except Exception as exc:
+            print(f"window probe: failed to capture monitor {monitor_index}: {exc}", flush=True)
+            continue
+        for _hwnd, area in _visible_game_window_candidates(base_monitor):
+            frame, cropped_monitor = _crop_frame_to_area(base_frame, base_monitor, area)
+            if frame.shape[:2] == base_frame.shape[:2]:
+                continue
+            state = detector.detect(frame, warn_aspect=False)
+            if state.label == "unknown":
+                continue
+            title_match = INPUT_TARGET_WINDOW_TITLE.strip().lower() in area.get("title", "").lower()
+            aspect = int(area["width"]) / max(1, int(area["height"]))
+            score = _window_area_intersection_score(area, base_monitor)
+            if title_match:
+                score += 10_000_000
+            score -= abs(aspect - BASE_ASPECT) * 100_000
+            probes.append(
+                CaptureProbe(
+                    monitor_index=monitor_index,
+                    area=area,
+                    frame=frame,
+                    monitor=cropped_monitor,
+                    state=state,
+                    score=score,
+                )
+            )
+    if not probes:
+        return None
+    probes.sort(key=lambda probe: probe.score, reverse=True)
+    best = probes[0]
+    print(
+        "window probe: selected "
+        f"monitor={best.monitor_index}, state={best.state.label}, "
+        f"area={best.area}, frame_shape={best.frame.shape}",
+        flush=True,
+    )
+    _FORCED_CAPTURE_AREAS[best.monitor_index] = best.area
+    return best
 
 
 def resolve_monitor_index(monitor_value: object) -> int:
@@ -2107,7 +2240,7 @@ def sleep_interruptible(seconds: float, stop_keys: list[str], stop_file: Path | 
     return False
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class LiveConfig:
     detector: CznDetector
     act: bool
@@ -2153,6 +2286,7 @@ class LiveRuntime:
     wait_for_dialog_until: float = 0.0
     dialog_advance_armed: bool = False
     expected_transition: ExpectedTransition | None = None
+    window_probe_attempted: bool = False
 
 
 class LiveSession:
@@ -2193,6 +2327,18 @@ class LiveSession:
                     print(f"using monitor {cfg.monitor_index}: {monitor}; frame_shape={frame.shape}")
                     self.runtime.printed_monitor = True
                 state = cfg.detector.detect(frame)
+                if state.label == "unknown" and not self.runtime.window_probe_attempted:
+                    self.runtime.window_probe_attempted = True
+                    probe = probe_game_window_capture(cfg.detector, cfg.capture_method)
+                    if probe:
+                        cfg.monitor_index = probe.monitor_index
+                        frame = probe.frame
+                        monitor = probe.monitor
+                        state = probe.state
+                        print(
+                            f"using probed monitor {cfg.monitor_index}: {monitor}; frame_shape={frame.shape}",
+                            flush=True,
+                        )
                 now = time.time()
                 self.log_state(now, state)
                 self.check_expected_transition(now, state)
@@ -2277,6 +2423,53 @@ class LiveSession:
             "Possible causes: click missed, wrong monitor/resolution, stale screenshot, or UI timing too short."
         )
         self.runtime.expected_transition = None
+        self.recover_after_transition_timeout(transition, state)
+
+    def recover_after_transition_timeout(self, transition: ExpectedTransition, state: DetectionState) -> None:
+        rt = self.runtime
+        recovered: list[str] = []
+
+        if state.label == "start_screen":
+            rt.handled_start_screen = False
+            recovered.append("start_screen retry enabled")
+        elif state.label == "choice_screen":
+            rt.handled_choice_without_legend = False
+            recovered.append("choice_screen retry enabled")
+        elif state.label in {"card_reward", "dream_found"}:
+            rt.waiting_after_reward_action = False
+            recovered.append("reward action retry enabled")
+        elif state.label == "legend_choice":
+            rt.waiting_after_legend = False
+            rt.pending_legend_confirm_point = None
+            recovered.append("legend retry enabled")
+        elif state.label == "unknown" and transition.action_name in {
+            "team_enter",
+            "team_enter_fallback",
+            "dialog_advance_burst",
+            "legend_dialog_advance",
+        }:
+            rt.dialog_advance_armed = True
+            rt.wait_for_dialog_until = 0.0
+            recovered.append("unknown dialog advance re-armed")
+
+        if transition.action_name in {"start_enter"} and state.label == "start_screen":
+            rt.handled_start_screen = False
+        if transition.action_name in {"no_legend_chain"} and state.label == "choice_screen":
+            rt.handled_choice_without_legend = False
+
+        if recovered:
+            rt.last_action = 0.0
+            rt.next_action_delay = 0.0
+            print(
+                "RECOVERY: transition timed out; "
+                f"current={state.label}; {', '.join(recovered)}; re-running current state.",
+                flush=True,
+            )
+        else:
+            print(
+                "RECOVERY: transition timed out; no special latch matched, continuing with fresh detection.",
+                flush=True,
+            )
 
     def disarm_dialog(self) -> None:
         self.runtime.dialog_advance_armed = False
