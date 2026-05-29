@@ -22,7 +22,7 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 _DXGI_CAMERAS: dict[int, object] = {}
 _FORCED_CAPTURE_AREAS: dict[int, dict] = {}
 _RUN_LOG_HANDLE = None
@@ -950,9 +950,9 @@ class CznDetector:
     def _detect_choice_anchors(self, frame_gray: np.ndarray) -> MatchResult | None:
         h, w = frame_gray.shape[:2]
         glow_rois = [
-            Box(0.18, 0.84, 0.33, 0.998),
-            Box(0.44, 0.84, 0.59, 0.998),
-            Box(0.70, 0.84, 0.85, 0.998),
+            Box(0.12, 0.74, 0.38, 0.998),
+            Box(0.36, 0.74, 0.64, 0.998),
+            Box(0.62, 0.74, 0.90, 0.998),
         ]
         matches: list[MatchResult] = []
         for index, roi in enumerate(glow_rois, start=1):
@@ -961,19 +961,108 @@ class CznDetector:
                 self.choice_glow_template,
                 roi,
                 f"choice_glow_{index}",
-                threshold=0.60,
+                threshold=0.55,
             )
             if match:
                 matches.append(match)
-        if len(matches) < 3:
+        if len(matches) >= 3:
+            x1 = min(match.box[0] for match in matches)
+            y1 = min(match.box[1] for match in matches)
+            x2 = max(match.box[2] for match in matches)
+            y2 = max(match.box[3] for match in matches)
+            score = min(match.score for match in matches)
+            return MatchResult("choice_glows", score, (x1, y1, x2, y2))
+
+        return self._detect_choice_panel_layout(frame_gray)
+
+    def _detect_choice_panel_layout(self, frame_gray: np.ndarray) -> MatchResult | None:
+        height, width = frame_gray.shape[:2]
+        band_y1 = int(height * 0.58)
+        band_y2 = int(height * 0.985)
+        band = frame_gray[band_y1:band_y2, :]
+        if band.size == 0:
             return None
 
-        x1 = min(match.box[0] for match in matches)
-        y1 = min(match.box[1] for match in matches)
-        x2 = max(match.box[2] for match in matches)
-        y2 = max(match.box[3] for match in matches)
-        score = min(match.score for match in matches)
-        return MatchResult("choice_glows", score, (x1, y1, x2, y2))
+        edges = cv2.Canny(band, 40, 120)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, width // 80), max(3, height // 260)))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        panels: list[tuple[int, int, int, int]] = []
+        min_w = width * 0.16
+        max_w = width * 0.34
+        min_h = height * 0.16
+        max_h = height * 0.42
+        for contour in contours:
+            x, y, panel_w, panel_h = cv2.boundingRect(contour)
+            if not (min_w <= panel_w <= max_w and min_h <= panel_h <= max_h):
+                continue
+            y += band_y1
+            if y > height * 0.88:
+                continue
+            panels.append((x, y, x + panel_w, y + panel_h))
+
+        panels = self._dedupe_choice_panels(panels)
+        if len(panels) < 3:
+            return None
+        panels = self._best_choice_panel_triplet(panels, width, height)
+        if panels is None:
+            return None
+
+        x1 = min(box[0] for box in panels)
+        y1 = min(box[1] for box in panels)
+        x2 = max(box[2] for box in panels)
+        y2 = max(box[3] for box in panels)
+        return MatchResult("choice_panel_layout", 0.50, (x1, y1, x2, y2))
+
+    @staticmethod
+    def _dedupe_choice_panels(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+        boxes = sorted(boxes, key=lambda box: (box[2] - box[0]) * (box[3] - box[1]), reverse=True)
+        kept: list[tuple[int, int, int, int]] = []
+        for box in boxes:
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            duplicate = False
+            for existing in kept:
+                ecx = (existing[0] + existing[2]) / 2.0
+                ecy = (existing[1] + existing[3]) / 2.0
+                if abs(cx - ecx) < max(40, (existing[2] - existing[0]) * 0.35) and abs(cy - ecy) < max(40, (existing[3] - existing[1]) * 0.35):
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(box)
+        return kept
+
+    @staticmethod
+    def _best_choice_panel_triplet(
+        boxes: list[tuple[int, int, int, int]],
+        width: int,
+        height: int,
+    ) -> list[tuple[int, int, int, int]] | None:
+        best: tuple[float, list[tuple[int, int, int, int]]] | None = None
+        for left_index in range(len(boxes) - 2):
+            for mid_index in range(left_index + 1, len(boxes) - 1):
+                for right_index in range(mid_index + 1, len(boxes)):
+                    triplet = sorted(
+                        [boxes[left_index], boxes[mid_index], boxes[right_index]],
+                        key=lambda box: box[0],
+                    )
+                    centers = [((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0) for box in triplet]
+                    xs = [center[0] / max(1, width) for center in centers]
+                    ys = [center[1] / max(1, height) for center in centers]
+                    panel_widths = [(box[2] - box[0]) / max(1, width) for box in triplet]
+                    if not (xs[0] < 0.42 and 0.30 < xs[1] < 0.70 and xs[2] > 0.58):
+                        continue
+                    if xs[2] - xs[0] < 0.42:
+                        continue
+                    if min(ys) < 0.62 or max(ys) - min(ys) > 0.16:
+                        continue
+                    if max(panel_widths) - min(panel_widths) > 0.12:
+                        continue
+                    score = (xs[2] - xs[0]) - (max(ys) - min(ys)) - (max(panel_widths) - min(panel_widths))
+                    if best is None or score > best[0]:
+                        best = (score, triplet)
+        return best[1] if best else None
 
     def _best_match(
         self,
@@ -1940,6 +2029,11 @@ def _window_area_intersection_score(area: dict, monitor: dict) -> float:
     return float((right - left) * (bottom - top))
 
 
+def _window_title_matches_target(title: str) -> bool:
+    needle = INPUT_TARGET_WINDOW_TITLE.strip().lower()
+    return bool(needle and needle in title.lower())
+
+
 def _visible_game_window_candidates(monitor: dict) -> list[tuple[int, dict]]:
     user32 = ctypes.windll.user32
     candidates: list[tuple[int, dict]] = []
@@ -1954,15 +2048,18 @@ def _visible_game_window_candidates(monitor: dict) -> list[tuple[int, dict]]:
         if not _area_looks_like_game_window(area):
             return True
         area = dict(area)
+        title = _window_title(hwnd)
+        if INPUT_TARGET_WINDOW_TITLE.strip() and not _window_title_matches_target(title):
+            return True
         area["hwnd"] = int(hwnd)
-        area["title"] = _window_title(hwnd)
+        area["title"] = title
         candidates.append((int(hwnd), area))
         return True
 
     user32.EnumWindows(enum_proc, 0)
     candidates.sort(
         key=lambda item: (
-            INPUT_TARGET_WINDOW_TITLE.strip().lower() in item[1].get("title", "").lower(),
+            _window_title_matches_target(item[1].get("title", "")),
             _window_area_intersection_score(item[1], monitor),
         ),
         reverse=True,
