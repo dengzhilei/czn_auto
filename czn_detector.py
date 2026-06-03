@@ -21,11 +21,13 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
+DEFAULT_GAME_WINDOW_TITLE = "卡厄思梦境"
 _DXGI_CAMERAS: dict[int, object] = {}
 _RUN_LOG_HANDLE = None
 _RUN_LOG_STDOUT = None
 _RUN_LOG_STDERR = None
 _DEFAULT_UNRAISABLEHOOK = sys.unraisablehook
+_ENUM_WINDOWS_PROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
 
 class TeeStream:
@@ -208,6 +210,148 @@ def display_environment() -> dict:
     return info
 
 
+def _window_text(hwnd: int) -> str:
+    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buffer, length + 1)
+    return buffer.value
+
+
+def _window_pid(hwnd: int) -> int:
+    pid = ctypes.c_ulong()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def list_visible_windows() -> list[dict[str, object]]:
+    user32 = ctypes.windll.user32
+    windows: list[dict[str, object]] = []
+
+    @_ENUM_WINDOWS_PROC
+    def callback(hwnd, _lparam) -> bool:
+        hwnd_int = int(hwnd)
+        visible = bool(user32.IsWindowVisible(hwnd_int))
+        iconic = bool(user32.IsIconic(hwnd_int))
+        if not visible and not iconic:
+            return True
+        title = _window_text(hwnd_int).strip()
+        if not title:
+            return True
+        rect = window_client_rect(hwnd_int, allow_minimized=False)
+        if rect is None and iconic:
+            left, top, width, height = (-32000, -32000, 0, 0)
+        elif rect is None:
+            return True
+        else:
+            left, top, width, height = rect
+            if width < 200 or height < 150:
+                return True
+        windows.append(
+            {
+                "hwnd": hwnd_int,
+                "pid": _window_pid(hwnd_int),
+                "title": title,
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+                "minimized": iconic,
+            }
+        )
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return windows
+
+
+def find_window_by_title(title_query: str) -> int:
+    query = title_query.strip().lower()
+    if not query:
+        raise ValueError("window title query is empty")
+    exact: int | None = None
+    partial: int | None = None
+    user32 = ctypes.windll.user32
+
+    @_ENUM_WINDOWS_PROC
+    def callback(hwnd_raw, _lparam) -> bool:
+        nonlocal exact, partial
+        hwnd = int(hwnd_raw)
+        title = _window_text(hwnd).strip()
+        if not title:
+            return True
+        lowered = title.lower()
+        if lowered == query:
+            exact = hwnd
+            return False
+        if partial is None and query in lowered:
+            partial = hwnd
+        return True
+
+    user32.EnumWindows(callback, 0)
+    hwnd = exact or partial
+    if hwnd:
+        return hwnd
+    raise RuntimeError(f"no visible window title contains: {title_query!r}")
+
+
+def window_client_rect(hwnd: int, *, allow_minimized: bool = True) -> tuple[int, int, int, int] | None:
+    user32 = ctypes.windll.user32
+    if not hwnd or not user32.IsWindow(hwnd):
+        return None
+    if not allow_minimized and user32.IsIconic(hwnd):
+        return None
+
+    class Rect(ctypes.Structure):
+        _fields_ = (("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long))
+
+    class Point(ctypes.Structure):
+        _fields_ = (("x", ctypes.c_long), ("y", ctypes.c_long))
+
+    rect = Rect()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
+    width = int(rect.right - rect.left)
+    height = int(rect.bottom - rect.top)
+    if width <= 0 or height <= 0:
+        return None
+    point = Point(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(point)):
+        return None
+    return int(point.x), int(point.y), width, height
+
+
+def window_outer_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    user32 = ctypes.windll.user32
+    if not hwnd or not user32.IsWindow(hwnd):
+        return None
+
+    class Rect(ctypes.Structure):
+        _fields_ = (("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long))
+
+    rect = Rect()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+
+
+def ensure_window_not_minimized(hwnd: int, title: str) -> bool:
+    user32 = ctypes.windll.user32
+    if not user32.IsIconic(hwnd):
+        return True
+    print(f"window is minimized; trying ShowWindow(SW_SHOWNOACTIVATE): {title!r}", flush=True)
+    user32.ShowWindow(hwnd, 4)
+    time.sleep(0.25)
+    if not user32.IsIconic(hwnd):
+        return True
+    print(
+        "window is still minimized. Restore the game window without covering it, then retry.",
+        flush=True,
+    )
+    return False
+
+
 def runtime_timing_profile() -> dict:
     return {
         "live_loop_interval": LIVE_LOOP_INTERVAL,
@@ -253,6 +397,9 @@ def runtime_timing_profile() -> dict:
         "delay_unknown_idle": DELAY_UNKNOWN_IDLE,
         "delay_after_legend_confirm": DELAY_AFTER_LEGEND_CONFIRM,
         "click_window_log": LOG_CLICK_WINDOW,
+        "click_method": CLICK_METHOD,
+        "click_restore_after_action": CLICK_RESTORE_AFTER_ACTION,
+        "postmessage_fallback_sendinput": POSTMESSAGE_FALLBACK_SENDINPUT,
     }
 
 
@@ -462,6 +609,9 @@ POST_CLICK_WAIT = 4.0
 REWARD_SETTLE_BEFORE_ACTION = 1.5
 SAVE_VISUAL_CHANGE_DEBUG = False
 LOG_CLICK_WINDOW = False
+CLICK_METHOD = "postmessage"
+CLICK_RESTORE_AFTER_ACTION = True
+POSTMESSAGE_FALLBACK_SENDINPUT = False
 
 # 识别等待轮询间隔，用在等待“脱逃页/确认弹窗/回首页”等关键状态。
 
@@ -563,6 +713,9 @@ CONFIG_BINDINGS = {
         "delay_after_unknown_burst": ("DELAY_AFTER_UNKNOWN_BURST", "nonnegative_float"),
         "delay_unknown_idle": ("DELAY_UNKNOWN_IDLE", "nonnegative_float"),
         "delay_after_legend_confirm": ("DELAY_AFTER_LEGEND_CONFIRM", "nonnegative_float"),
+        "click_method": ("CLICK_METHOD", "click_method"),
+        "click_restore_after_action": ("CLICK_RESTORE_AFTER_ACTION", "bool"),
+        "postmessage_fallback_sendinput": ("POSTMESSAGE_FALLBACK_SENDINPUT", "bool"),
     },
 }
 
@@ -630,6 +783,9 @@ def default_user_config() -> dict:
             "delay_after_unknown_burst": DELAY_AFTER_UNKNOWN_BURST,
             "delay_unknown_idle": DELAY_UNKNOWN_IDLE,
             "delay_after_legend_confirm": DELAY_AFTER_LEGEND_CONFIRM,
+            "click_method": CLICK_METHOD,
+            "click_restore_after_action": CLICK_RESTORE_AFTER_ACTION,
+            "postmessage_fallback_sendinput": POSTMESSAGE_FALLBACK_SENDINPUT,
         },
     }
 
@@ -647,7 +803,7 @@ def write_default_config(path: Path, overwrite: bool = False) -> Path:
 
 def _coerce_config_value(value: object, kind: str, label: str) -> object:
     if kind == "point":
-        if not isinstance(value, list | tuple) or len(value) != 2:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
             raise ValueError(f"{label} must be [x, y]")
         x = float(value[0])
         y = float(value[1])
@@ -678,6 +834,21 @@ def _coerce_config_value(value: object, kind: str, label: str) -> object:
         text = str(value)
         if text not in {"rapid", "checked"}:
             raise ValueError(f"{label} must be rapid or checked")
+        return text
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "yes", "on"}:
+                return True
+            if text in {"0", "false", "no", "off"}:
+                return False
+        raise ValueError(f"{label} must be true or false")
+    if kind == "click_method":
+        text = str(value)
+        if text not in {"sendinput", "postmessage"}:
+            raise ValueError(f"{label} must be sendinput or postmessage")
         return text
     raise ValueError(f"unknown config type {kind}")
 
@@ -742,9 +913,10 @@ class CznDetector:
     def __init__(self, template_dir: Path | None = None, wide_match_scales: bool = False) -> None:
         visible_templates = app_install_dir() / "templates"
         bundled_templates = app_base_dir() / "templates"
-        self.template_dir = template_dir or (visible_templates if visible_templates.exists() else bundled_templates)
+        self.template_dir = template_dir or self._default_template_dir(visible_templates, bundled_templates)
         self.match_scale_factors = WIDE_MATCH_SCALE_FACTORS if wide_match_scales else FAST_MATCH_SCALE_FACTORS
         self._warned_aspect_sizes: set[tuple[int, int]] = set()
+        self._scaled_template_cache: dict[tuple[int, float], tuple[int, int, np.ndarray]] = {}
         self.legend_template = self._load_template("legend_word.jpg")
         self.legend_wide_template = self._load_template("legend_word_wide.jpg")
         self.dream_template = self._load_template("dream_border_title.jpg")
@@ -754,13 +926,29 @@ class CznDetector:
         self.top_right_menu_template = self._load_template("combat_top_right_menu.jpg")
         self.flee_button_template = self._load_template("flee_button.jpg")
         self.team_enter_template = self._load_template("team_enter_button.jpg")
+        self.stage_enter_template = self._load_optional_template("stage_enter_button.jpg")
         self.return_confirm_template = self._load_template("return_confirm_button.jpg")
+
+    def _default_template_dir(self, visible_templates: Path, bundled_templates: Path) -> Path:
+        required = "legend_word.jpg"
+        if visible_templates.is_dir() and (visible_templates / required).exists():
+            return visible_templates
+        return bundled_templates
 
     def _load_template(self, name: str) -> np.ndarray:
         path = self.template_dir / name
         image = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise FileNotFoundError(f"template not found or unreadable: {path}")
+        return image
+
+    def _load_optional_template(self, name: str) -> np.ndarray | None:
+        path = self.template_dir / name
+        if not path.exists():
+            return None
+        image = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            print(f"warning: optional template unreadable: {path}", flush=True)
         return image
 
     def detect(self, frame_bgr: np.ndarray) -> DetectionState:
@@ -840,6 +1028,17 @@ class CznDetector:
         if team_enter:
             return detection_state(team_enter=team_enter)
 
+        if self.stage_enter_template is not None:
+            stage_enter = self._match_in_roi(
+                frame_gray,
+                self.stage_enter_template,
+                Box(0.66, 0.84, 0.995, 0.995),
+                "stage_enter_button",
+                threshold=0.72,
+            )
+            if stage_enter:
+                return detection_state(start_screen=stage_enter)
+
         start_screen = self._match_in_roi(
             frame_gray,
             self.start_enter_template,
@@ -910,12 +1109,9 @@ class CznDetector:
         best_loc = (0, 0)
         best_size = (0, 0)
         for scale_factor in self.match_scale_factors:
-            scale = base_scale * scale_factor
-            tw = max(8, int(round(template_gray.shape[1] * scale)))
-            th = max(8, int(round(template_gray.shape[0] * scale)))
+            tw, th, template = self._scaled_template(template_gray, base_scale, scale_factor)
             if tw >= haystack.shape[1] or th >= haystack.shape[0]:
                 continue
-            template = cv2.resize(template_gray, (tw, th), interpolation=cv2.INTER_AREA)
             score_map = cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED)
             _, max_score, _, max_loc = cv2.minMaxLoc(score_map)
             if max_score > best_score:
@@ -933,6 +1129,25 @@ class CznDetector:
             score=float(max_score),
             box=(x1 + mx, y1 + my, x1 + mx + tw, y1 + my + th),
         )
+
+    def _scaled_template(
+        self,
+        template_gray: np.ndarray,
+        base_scale: float,
+        scale_factor: float,
+    ) -> tuple[int, int, np.ndarray]:
+        scale = base_scale * scale_factor
+        key = (id(template_gray), round(scale, 6))
+        cached = self._scaled_template_cache.get(key)
+        if cached is not None:
+            return cached
+
+        tw = max(8, int(round(template_gray.shape[1] * scale)))
+        th = max(8, int(round(template_gray.shape[0] * scale)))
+        resized = cv2.resize(template_gray, (tw, th), interpolation=cv2.INTER_AREA)
+        cached = (tw, th, resized)
+        self._scaled_template_cache[key] = cached
+        return cached
 
     def _template_scale(self, width: int, height: int) -> float:
         # For same-aspect fullscreen captures, 4K/2K/1080P share one uniform UI scale.
@@ -1061,6 +1276,8 @@ def print_state(prefix: str, state: DetectionState) -> None:
 def start_match_looks_like_team_fallback(state: DetectionState, frame_shape: tuple[int, ...]) -> bool:
     if not state.start_screen:
         return False
+    if state.start_screen.name == "stage_enter_button":
+        return False
     h, w = frame_shape[:2]
     cx, cy = state.start_screen.center
     return (cx / max(1, w)) <= TEAM_FALLBACK_MATCH_MAX_X and (cy / max(1, h)) >= TEAM_FALLBACK_MATCH_MIN_Y
@@ -1089,6 +1306,114 @@ def _screen_shot_mss(monitor_index: int) -> tuple[np.ndarray, dict]:
     return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR), monitor
 
 
+def _screen_shot_window_mss(window_title: str) -> tuple[np.ndarray, dict]:
+    import mss
+
+    hwnd = find_window_by_title(window_title)
+    if not ensure_window_not_minimized(hwnd, window_title):
+        raise RuntimeError(f"window is minimized and could not be restored without activation: {window_title!r}")
+    rect = window_client_rect(hwnd)
+    if rect is None:
+        raise RuntimeError(f"window is minimized or has no capturable client area: {window_title!r}")
+    left, top, width, height = rect
+    monitor = {
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+        "hwnd": hwnd,
+        "pid": _window_pid(hwnd),
+        "title": _window_text(hwnd),
+        "source": "window",
+    }
+    mss_cls = getattr(mss, "MSS", None) or getattr(mss, "mss")
+    with mss_cls() as sct:
+        raw = np.array(sct.grab({"left": left, "top": top, "width": width, "height": height}))
+    return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR), monitor
+
+
+def _screen_shot_window_printwindow(window_title: str) -> tuple[np.ndarray, dict]:
+    hwnd = find_window_by_title(window_title)
+    if not ensure_window_not_minimized(hwnd, window_title):
+        raise RuntimeError(f"window is minimized and could not be restored without activation: {window_title!r}")
+    rect = window_client_rect(hwnd)
+    if rect is None:
+        raise RuntimeError(f"window is minimized or has no capturable client area: {window_title!r}")
+    left, top, width, height = rect
+    outer = window_outer_rect(hwnd)
+    src_x = max(0, left - outer[0]) if outer else 0
+    src_y = max(0, top - outer[1]) if outer else 0
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    hdc_window = user32.GetWindowDC(hwnd)
+    if not hdc_window:
+        raise RuntimeError(f"GetWindowDC failed for window: {window_title!r}")
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_window)
+    hbmp = gdi32.CreateCompatibleBitmap(hdc_window, width, height)
+    old_obj = gdi32.SelectObject(hdc_mem, hbmp)
+
+    class BitmapInfoHeader(ctypes.Structure):
+        _fields_ = (
+            ("biSize", ctypes.c_uint32),
+            ("biWidth", ctypes.c_long),
+            ("biHeight", ctypes.c_long),
+            ("biPlanes", ctypes.c_uint16),
+            ("biBitCount", ctypes.c_uint16),
+            ("biCompression", ctypes.c_uint32),
+            ("biSizeImage", ctypes.c_uint32),
+            ("biXPelsPerMeter", ctypes.c_long),
+            ("biYPelsPerMeter", ctypes.c_long),
+            ("biClrUsed", ctypes.c_uint32),
+            ("biClrImportant", ctypes.c_uint32),
+        )
+
+    class BitmapInfo(ctypes.Structure):
+        _fields_ = (("bmiHeader", BitmapInfoHeader), ("bmiColors", ctypes.c_uint32 * 3))
+
+    try:
+        # Match ok-script's BitBlt_RenderFull flow: ask DWM to render full
+        # content, then BitBlt the client area from the window DC.
+        user32.PrintWindow(hwnd, hdc_window, 0x00000002)
+        if not gdi32.BitBlt(hdc_mem, 0, 0, width, height, hdc_window, src_x, src_y, 0x00CC0020):
+            raise RuntimeError(f"BitBlt failed for window: {window_title!r}")
+        bmi = BitmapInfo()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+        bmi.bmiHeader.biWidth = width
+        bmi.bmiHeader.biHeight = -height
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        buffer = np.empty((height, width, 4), dtype=np.uint8)
+        scan_lines = gdi32.GetDIBits(
+            hdc_mem,
+            hbmp,
+            0,
+            height,
+            buffer.ctypes.data_as(ctypes.c_void_p),
+            ctypes.byref(bmi),
+            0,
+        )
+        if scan_lines != height:
+            raise RuntimeError(f"GetDIBits returned {scan_lines}/{height} lines")
+    finally:
+        gdi32.SelectObject(hdc_mem, old_obj)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(hwnd, hdc_window)
+
+    monitor = {
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+        "hwnd": hwnd,
+        "pid": _window_pid(hwnd),
+        "title": _window_text(hwnd),
+        "source": "printwindow",
+    }
+    return cv2.cvtColor(buffer, cv2.COLOR_BGRA2BGR), monitor
+
+
 def _screen_shot_dxgi(monitor_index: int) -> tuple[np.ndarray, dict]:
     import dxcam
 
@@ -1113,7 +1438,15 @@ def _screen_shot_dxgi(monitor_index: int) -> tuple[np.ndarray, dict]:
     return frame.copy(), _monitor_meta(monitor_index)
 
 
-def screen_shot(monitor_index: int, capture_method: str = "dxgi") -> tuple[np.ndarray, dict]:
+def screen_shot(
+    monitor_index: int,
+    capture_method: str = "dxgi",
+    window_title: str | None = None,
+) -> tuple[np.ndarray, dict]:
+    if window_title:
+        if capture_method in {"printwindow", "bitblt-renderfull"}:
+            return _screen_shot_window_printwindow(window_title)
+        return _screen_shot_window_mss(window_title)
     if capture_method == "dxgi":
         try:
             return _screen_shot_dxgi(monitor_index)
@@ -1160,6 +1493,7 @@ def wait_visual_change(
     before_frame: np.ndarray,
     monitor_index: int,
     capture_method: str,
+    window_title: str | None,
     stop_keys: list[str],
     stop_file: Path | None,
     timeout: float,
@@ -1184,7 +1518,7 @@ def wait_visual_change(
         if stop_requested(stop_keys, stop_file):
             return
         time.sleep(VISUAL_CHANGE_POLL_INTERVAL)
-        after_frame, _ = screen_shot(monitor_index, capture_method)
+        after_frame, _ = screen_shot(monitor_index, capture_method, window_title)
         after_state = detector.detect(after_frame)
         score = visual_diff_score(before_frame, after_frame)
         roi_score = roi_visual_diff_score(before_frame, after_frame, Box(0.0, 0.60, 1.0, 1.0))
@@ -1219,6 +1553,7 @@ def wait_for_detected_state(
     detector: CznDetector,
     monitor_index: int,
     capture_method: str,
+    window_title: str | None,
     stop_keys: list[str],
     stop_file: Path | None,
     expected_labels: set[str],
@@ -1233,7 +1568,7 @@ def wait_for_detected_state(
     while time.time() < deadline:
         if sleep_interruptible(VISUAL_CHANGE_POLL_INTERVAL, stop_keys, stop_file):
             return None
-        frame, monitor = screen_shot(monitor_index, capture_method)
+        frame, monitor = screen_shot(monitor_index, capture_method, window_title)
         state = detector.detect(frame)
         poll_count += 1
         last_state = state
@@ -1259,6 +1594,7 @@ def fast_advance_unknown(
     monitor: dict,
     monitor_index: int,
     capture_method: str,
+    window_title: str | None,
     stop_keys: list[str],
     stop_file: Path | None,
     act: bool,
@@ -1283,6 +1619,7 @@ def fast_advance_unknown(
             detector,
             monitor_index,
             capture_method,
+            window_title,
             stop_keys,
             stop_file,
             DIALOG_BURST_STOP_LABELS,
@@ -1307,6 +1644,7 @@ def fast_advance_unknown(
             monitor,
             monitor_index,
             capture_method,
+            window_title,
             stop_keys,
             stop_file,
             act,
@@ -1321,6 +1659,7 @@ def fast_advance_unknown(
         monitor,
         monitor_index,
         capture_method,
+        window_title,
         stop_keys,
         stop_file,
         act,
@@ -1335,6 +1674,7 @@ def checked_dialog_advance(
     monitor: dict,
     monitor_index: int,
     capture_method: str,
+    window_title: str | None,
     stop_keys: list[str],
     stop_file: Path | None,
     act: bool,
@@ -1351,7 +1691,7 @@ def checked_dialog_advance(
         if sleep_interruptible(tap_delay, stop_keys, stop_file):
             return clicks
         if act:
-            frame, _ = screen_shot(monitor_index, capture_method)
+            frame, _ = screen_shot(monitor_index, capture_method, window_title)
             state = detector.detect(frame)
             print_state(f"{prefix} {i + 1}/{max_taps}", state)
             if state.label in DIALOG_BURST_STOP_LABELS:
@@ -1399,6 +1739,7 @@ def fast_abandon_no_legend(
     monitor: dict,
     monitor_index: int,
     capture_method: str,
+    window_title: str | None,
     stop_keys: list[str],
     stop_file: Path | None,
     act: bool,
@@ -1421,6 +1762,7 @@ def fast_abandon_no_legend(
             detector,
             monitor_index,
             capture_method,
+            window_title,
             stop_keys,
             stop_file,
             {"flee_screen"},
@@ -1451,6 +1793,7 @@ def fast_abandon_no_legend(
             detector,
             monitor_index,
             capture_method,
+            window_title,
             stop_keys,
             stop_file,
             {"return_confirm"},
@@ -1497,6 +1840,18 @@ class Input(ctypes.Structure):
     _fields_ = (("type", ctypes.c_ulong), ("union", InputUnion))
 
 
+class Point(ctypes.Structure):
+    _fields_ = (("x", ctypes.c_long), ("y", ctypes.c_long))
+
+
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+MK_LBUTTON = 0x0001
+WM_ACTIVATE = 0x0006
+WA_ACTIVE = 0x0001
+
+
 def _send_mouse(flags: int, x: int | None = None, y: int | None = None) -> bool:
     mi = MouseInput()
     if x is not None and y is not None:
@@ -1515,18 +1870,73 @@ def _send_mouse(flags: int, x: int | None = None, y: int | None = None) -> bool:
     return ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp)) == 1
 
 
-def click_screen_xy(x: int, y: int, duration: float = 0.08) -> None:
-    hwnd = window_at(x, y)
-    if hwnd:
-        ensure_foreground_and_top(hwnd)
-    ctypes.windll.user32.SetCursorPos(x, y)
-    time.sleep(CLICK_MOVE_DELAY)
-    _send_mouse(0x0001, x, y)
-    time.sleep(CLICK_ABSOLUTE_MOVE_DELAY)
-    _send_mouse(0x0002)
+def _post_window_click(hwnd: int, x: int, y: int, duration: float = 0.08) -> bool:
+    if not hwnd:
+        return False
+
+    point = Point(x, y)
+    user32 = ctypes.windll.user32
+    if not user32.ScreenToClient(hwnd, ctypes.byref(point)):
+        return False
+    lparam = ((int(point.y) & 0xFFFF) << 16) | (int(point.x) & 0xFFFF)
+    user32.PostMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE, 0)
+    ok_move = user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam)
+    ok_down = user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
     time.sleep(duration)
-    _send_mouse(0x0004)
-    time.sleep(CLICK_AFTER_UP_DELAY)
+    ok_up = user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
+    return bool(ok_move and ok_down and ok_up)
+
+
+def cursor_position() -> tuple[int, int]:
+    point = Point()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+    return int(point.x), int(point.y)
+
+
+def restore_foreground(hwnd: int) -> None:
+    if not hwnd or not ctypes.windll.user32.IsWindow(hwnd):
+        return
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+    user32.SetForegroundWindow(hwnd)
+
+
+def click_screen_xy(x: int, y: int, duration: float = 0.08) -> None:
+    user32 = ctypes.windll.user32
+    restore_hwnd = user32.GetForegroundWindow() if CLICK_RESTORE_AFTER_ACTION else 0
+    restore_pos = cursor_position() if CLICK_RESTORE_AFTER_ACTION else None
+    hwnd = window_at(x, y)
+    try:
+        if hwnd:
+            ensure_foreground_and_top(hwnd)
+        user32.SetCursorPos(x, y)
+        time.sleep(CLICK_MOVE_DELAY)
+        _send_mouse(0x0001, x, y)
+        time.sleep(CLICK_ABSOLUTE_MOVE_DELAY)
+        _send_mouse(0x0002)
+        time.sleep(duration)
+        _send_mouse(0x0004)
+        time.sleep(CLICK_AFTER_UP_DELAY)
+    finally:
+        if CLICK_RESTORE_AFTER_ACTION and restore_pos:
+            if restore_hwnd and restore_hwnd != hwnd:
+                restore_foreground(restore_hwnd)
+            user32.SetCursorPos(*restore_pos)
+            time.sleep(0.06)
+            user32.SetCursorPos(*restore_pos)
+
+
+def click_monitor_xy(x: int, y: int, monitor: dict, duration: float = 0.08) -> None:
+    hwnd = int(monitor.get("hwnd") or 0)
+    if CLICK_METHOD == "postmessage" and hwnd:
+        print(f"postmessage click screen=({x},{y}) hwnd=0x{hwnd:x}", flush=True)
+        if _post_window_click(hwnd, x, y, duration=duration):
+            return
+        if not POSTMESSAGE_FALLBACK_SENDINPUT:
+            print("postmessage click failed; skipped SendInput to avoid foreground activation.", flush=True)
+            return
+        print("postmessage click failed; falling back to SendInput.", flush=True)
+    click_screen_xy(x, y, duration=duration)
 
 
 def ensure_foreground_and_top(hwnd: int) -> bool:
@@ -1577,7 +1987,7 @@ def click_norm(point: tuple[float, float], monitor: dict, duration: float = 0.08
     x = int(monitor["left"] + monitor["width"] * point[0])
     y = int(monitor["top"] + monitor["height"] * point[1])
     print(f"click screen=({x},{y}){click_log_suffix(x, y)}", flush=True)
-    click_screen_xy(x, y, duration=duration)
+    click_monitor_xy(x, y, monitor, duration=duration)
 
 
 def rapid_click_norm(
@@ -1592,33 +2002,69 @@ def rapid_click_norm(
     x = int(monitor["left"] + monitor["width"] * point[0])
     y = int(monitor["top"] + monitor["height"] * point[1])
     print(f"rapid click screen=({x},{y}) count={count}{click_log_suffix(x, y)}", flush=True)
-    hwnd = window_at(x, y)
-    if hwnd:
-        ensure_foreground_and_top(hwnd)
-    ctypes.windll.user32.SetCursorPos(x, y)
+    hwnd = int(monitor.get("hwnd") or 0)
     sent = 0
-    for _ in range(count):
-        if stop_requested(stop_keys, stop_file):
+    if CLICK_METHOD == "postmessage" and hwnd:
+        for _ in range(count):
+            if stop_requested(stop_keys, stop_file):
+                return sent
+            if not _post_window_click(hwnd, x, y, duration=duration):
+                if not POSTMESSAGE_FALLBACK_SENDINPUT:
+                    print("postmessage rapid click failed; skipped SendInput to avoid foreground activation.", flush=True)
+                    return sent
+                print("postmessage rapid click failed; falling back to SendInput.", flush=True)
+                break
+            sent += 1
+            if sleep_interruptible(interval, stop_keys, stop_file):
+                return sent
+        if sent == count:
             return sent
-        _send_mouse(0x0002)
-        time.sleep(duration)
-        _send_mouse(0x0004)
-        sent += 1
-        if sleep_interruptible(interval, stop_keys, stop_file):
-            return sent
-    return sent
+    remaining = count - sent if CLICK_METHOD == "postmessage" and hwnd else count
+    if remaining <= 0:
+        return sent
+    user32 = ctypes.windll.user32
+    restore_hwnd = user32.GetForegroundWindow() if CLICK_RESTORE_AFTER_ACTION else 0
+    restore_pos = cursor_position() if CLICK_RESTORE_AFTER_ACTION else None
+    hwnd = window_at(x, y)
+    try:
+        if hwnd:
+            ensure_foreground_and_top(hwnd)
+        user32.SetCursorPos(x, y)
+        for _ in range(remaining):
+            if stop_requested(stop_keys, stop_file):
+                return sent
+            _send_mouse(0x0002)
+            time.sleep(duration)
+            _send_mouse(0x0004)
+            sent += 1
+            if sleep_interruptible(interval, stop_keys, stop_file):
+                return sent
+        return sent
+    finally:
+        if CLICK_RESTORE_AFTER_ACTION and restore_pos:
+            if restore_hwnd and restore_hwnd != hwnd:
+                restore_foreground(restore_hwnd)
+            user32.SetCursorPos(*restore_pos)
+            time.sleep(0.06)
+            user32.SetCursorPos(*restore_pos)
 
 
 def click_frame_point(point: tuple[int, int], monitor: dict, duration: float = 0.08) -> None:
     x = int(monitor["left"] + point[0])
     y = int(monitor["top"] + point[1])
     print(f"click screen=({x},{y}){click_log_suffix(x, y)}", flush=True)
-    click_screen_xy(x, y, duration=duration)
+    click_monitor_xy(x, y, monitor, duration=duration)
 
 
 def parse_stop_keys(stop_key: str) -> list[str]:
     keys = [key.strip().lower() for key in stop_key.split(",") if key.strip()]
-    return [key for key in keys if key in VK_CODES]
+    if not keys:
+        return ["f8"]
+    unknown = sorted(set(keys) - set(VK_CODES))
+    if unknown:
+        supported = ", ".join(sorted(VK_CODES))
+        raise ValueError(f"unsupported stop key(s): {', '.join(unknown)}. Supported: {supported}")
+    return keys
 
 
 def stop_requested(stop_keys: list[str], stop_file: Path | None) -> bool:
@@ -1655,6 +2101,7 @@ class LiveConfig:
     stop_file: Path | None
     post_click_wait: float
     capture_method: str
+    window_title: str | None
     fast_start_to_team_enabled: bool
     log_interval: float
     wait_after_team_enter: float
@@ -1704,6 +2151,7 @@ class LiveSession:
             "live config: "
             f"act={cfg.act}, interval={cfg.interval}, log_interval={cfg.log_interval}, "
             f"monitor={cfg.monitor_index}, max_seconds={cfg.max_seconds}, max_clicks={cfg.max_clicks}, "
+            f"window_title={cfg.window_title!r}, "
             f"no_dream_action={cfg.no_dream_action}, advance_on_unknown={cfg.advance_on_unknown}, "
             f"fast_start_to_team={cfg.fast_start_to_team_enabled}, post_click_wait={cfg.post_click_wait}, "
             f"wait_after_team_enter={cfg.wait_after_team_enter}, dialog_burst_mode={cfg.dialog_burst_mode}, "
@@ -1720,7 +2168,7 @@ class LiveSession:
             while True:
                 if self.should_stop():
                     return
-                frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method)
+                frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method, cfg.window_title)
                 if not self.runtime.printed_monitor:
                     print(f"using monitor {cfg.monitor_index}: {monitor}; frame_shape={frame.shape}")
                     self.runtime.printed_monitor = True
@@ -1848,6 +2296,7 @@ class LiveSession:
             frame,
             cfg.monitor_index,
             cfg.capture_method,
+            cfg.window_title,
             cfg.stop_keys,
             cfg.stop_file,
             cfg.post_click_wait,
@@ -1865,6 +2314,7 @@ class LiveSession:
             cfg.detector,
             cfg.monitor_index,
             cfg.capture_method,
+            cfg.window_title,
             cfg.stop_keys,
             cfg.stop_file,
             {"card_reward", "dream_found", "unknown"},
@@ -1884,6 +2334,7 @@ class LiveSession:
             next_monitor or monitor,
             cfg.monitor_index,
             cfg.capture_method,
+            cfg.window_title,
             cfg.stop_keys,
             cfg.stop_file,
             cfg.act,
@@ -1934,7 +2385,7 @@ class LiveSession:
             print(f"reward screen: settle {REWARD_SETTLE_BEFORE_ACTION:.1f}s before checking cards.")
             if sleep_interruptible(REWARD_SETTLE_BEFORE_ACTION, cfg.stop_keys, cfg.stop_file):
                 return False
-            frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method)
+            frame, monitor = screen_shot(cfg.monitor_index, cfg.capture_method, cfg.window_title)
             state = cfg.detector.detect(frame)
             print_state("reward settle", state)
             if state.dream_card:
@@ -2032,6 +2483,7 @@ class LiveSession:
             monitor,
             cfg.monitor_index,
             cfg.capture_method,
+            cfg.window_title,
             cfg.stop_keys,
             cfg.stop_file,
             cfg.act,
@@ -2044,6 +2496,9 @@ class LiveSession:
                 {"return_confirm", "start_screen", "team_screen", "unknown"},
                 max(cfg.post_click_wait, CHAIN_MENU_TO_FLEE_TIMEOUT + CHAIN_FLEE_TO_CONFIRM_TIMEOUT + 1.0),
             )
+            rt.wait_for_dialog_until = time.time() + 0.6
+            rt.dialog_advance_armed = True
+            print("choice chain reached possible dialog/loading; controlled unknown advance armed.")
         rt.handled_choice_without_legend = True
         self.mark_action(now, DELAY_AFTER_NO_LEGEND_CHAIN)
         return True
@@ -2146,11 +2601,11 @@ class LiveSession:
         cfg = self.config
         rt = self.runtime
         self.reset_common(dialog=False)
-        if not cfg.advance_on_unknown:
-            print("unknown screen: no click. Pass --advance-on-unknown to enable blind advance clicks.")
-            self.mark_action(now, DELAY_UNKNOWN_IDLE)
-            return True
         if not rt.dialog_advance_armed:
+            if not cfg.advance_on_unknown:
+                print("unknown screen: no click. Pass --advance-on-unknown to enable blind advance clicks.")
+                self.mark_action(now, DELAY_UNKNOWN_IDLE)
+                return True
             print("unknown screen: dialog advance is not armed; waiting for a team enter first.")
             self.mark_action(now, DELAY_UNKNOWN_IDLE)
             return not sleep_interruptible(cfg.interval, cfg.stop_keys, cfg.stop_file)
@@ -2165,6 +2620,7 @@ class LiveSession:
             monitor,
             cfg.monitor_index,
             cfg.capture_method,
+            cfg.window_title,
             cfg.stop_keys,
             cfg.stop_file,
             cfg.act,
@@ -2195,6 +2651,7 @@ def run_live(
     stop_file: Path | None,
     post_click_wait: float,
     capture_method: str,
+    window_title: str | None,
     fast_start_to_team_enabled: bool,
     log_interval: float,
     wait_after_team_enter: float,
@@ -2215,6 +2672,7 @@ def run_live(
             stop_file=stop_file,
             post_click_wait=post_click_wait,
             capture_method=capture_method,
+            window_title=window_title,
             fast_start_to_team_enabled=fast_start_to_team_enabled,
             log_interval=log_interval,
             wait_after_team_enter=wait_after_team_enter,
@@ -2223,12 +2681,30 @@ def run_live(
     ).run()
 
 
+def run_state_check(
+    detector: CznDetector,
+    monitor_index: int,
+    capture_method: str,
+    window_title: str | None,
+) -> None:
+    root = app_install_dir()
+    frame, monitor = screen_shot(monitor_index, capture_method, window_title)
+    state = detector.detect(frame)
+    print(f"capture={capture_method} monitor={monitor}")
+    print_state("fresh_state", state)
+    save_image(root / "debug_live" / "fresh_state.jpg", frame)
+    save_image(root / "debug_live" / "fresh_state_annotated.jpg", annotate(frame, state))
+
+
 def print_action(label: str, point: tuple[float, float], act: bool) -> None:
     mode = "ACT" if act else "DRY"
     print(f"{mode}: {label} at normalized {point}", flush=True)
 
 
 def main() -> None:
+    global CLICK_METHOD
+    global CLICK_RESTORE_AFTER_ACTION
+    global POSTMESSAGE_FALLBACK_SENDINPUT
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=Path, default=default_config_file())
     pre_parser.add_argument("--no-user-config", action="store_true")
@@ -2247,6 +2723,11 @@ def main() -> None:
     parser.add_argument("--init-config", action="store_true", help="Create the default user config file and exit.")
     parser.add_argument("--image", type=Path)
     parser.add_argument("--video", type=Path)
+    parser.add_argument("--gui", action="store_true", help="Open the graphical launcher.")
+    parser.add_argument("--state-check", action="store_true", help="Capture one fresh frame and classify the current state.")
+    parser.add_argument("--list-windows", action="store_true", help="List visible capturable windows and exit.")
+    parser.add_argument("--game-window", action="store_true", help="Capture the default CZN game window.")
+    parser.add_argument("--window-title", help="Capture the client area of the visible window whose title contains this text.")
     parser.add_argument("--every-sec", type=float, default=0.25)
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--log-file", type=Path, help="Write detailed run output to this log file. Defaults to LocalAppData\\CZN Auto\\logs.")
@@ -2258,6 +2739,24 @@ def main() -> None:
     parser.add_argument("--max-seconds", type=float, default=0.0, help="Stop live mode after this many seconds. 0 means run until stopped/found.")
     parser.add_argument("--max-clicks", type=int, default=0, help="Stop live mode after this many actual clicks. 0 means unlimited.")
     parser.add_argument("--post-click-wait", type=float, default=POST_CLICK_WAIT, help="Wait this many seconds after each click for a real visual change.")
+    parser.add_argument(
+        "--click-method",
+        choices=["sendinput", "postmessage"],
+        default=CLICK_METHOD,
+        help="sendinput uses the real mouse. postmessage sends background window click messages and does not move the cursor.",
+    )
+    parser.add_argument(
+        "--restore-after-click",
+        action=argparse.BooleanOptionalAction,
+        default=CLICK_RESTORE_AFTER_ACTION,
+        help="Restore the previous foreground window and cursor position after each SendInput click.",
+    )
+    parser.add_argument(
+        "--postmessage-fallback-sendinput",
+        action=argparse.BooleanOptionalAction,
+        default=POSTMESSAGE_FALLBACK_SENDINPUT,
+        help="Allow postmessage mode to fall back to real SendInput clicks when background messages fail.",
+    )
     parser.add_argument(
         "--wait-after-team-enter",
         type=float,
@@ -2273,9 +2772,9 @@ def main() -> None:
     parser.add_argument("--monitor", type=int, default=1, help="monitor index. 1 is primary on this machine; 2 is the secondary display.")
     parser.add_argument(
         "--capture-method",
-        choices=["dxgi", "mss"],
-        default="dxgi",
-        help="Live screenshot backend. DXGI is the default because mss returned stale frames after clicks in this game.",
+        choices=["dxgi", "mss", "printwindow", "bitblt-renderfull"],
+        default="printwindow",
+        help="Live screenshot backend. printwindow/bitblt-renderfull can capture some covered windows without foregrounding.",
     )
     parser.add_argument("--advance-on-unknown", action="store_true", help="Allow live mode to click the advance point when no known UI state is detected.")
     parser.add_argument(
@@ -2301,6 +2800,30 @@ def main() -> None:
         help="What live mode should do on a card reward screen when 梦之边境 is not detected.",
     )
     args = parser.parse_args()
+    if args.game_window and not args.window_title:
+        args.window_title = DEFAULT_GAME_WINDOW_TITLE
+    CLICK_METHOD = args.click_method
+    CLICK_RESTORE_AFTER_ACTION = args.restore_after_click
+    POSTMESSAGE_FALLBACK_SENDINPUT = args.postmessage_fallback_sendinput
+    if args.live:
+        try:
+            parse_stop_keys(args.stop_key)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    if args.list_windows:
+        for item in list_visible_windows():
+            print(
+                f"hwnd=0x{int(item['hwnd']):x} pid={item['pid']} "
+                f"{item['width']}x{item['height']}+{item['left']}+{item['top']} title={item['title']!r}"
+            )
+        return
+
+    if args.gui:
+        from czn_gui import main as gui_main
+
+        gui_main()
+        return
 
     log_path = None
     if not args.no_run_log:
@@ -2312,6 +2835,8 @@ def main() -> None:
         run_image(detector, args.image, args.out_dir)
     elif args.video:
         run_video(detector, args.video, args.every_sec, args.out_dir)
+    elif args.state_check:
+        run_state_check(detector, args.monitor, args.capture_method, args.window_title)
     elif args.live:
         run_live(
             detector,
@@ -2326,6 +2851,7 @@ def main() -> None:
             args.stop_file,
             args.post_click_wait,
             args.capture_method,
+            args.window_title,
             args.fast_start_to_team,
             args.log_interval,
             args.wait_after_team_enter,

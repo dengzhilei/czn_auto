@@ -59,6 +59,9 @@
     "delay_after_start_enter": 0.5,
     "delay_after_unknown_burst": 0.05,
     "delay_unknown_idle": 0.3,
-    "delay_after_legend_confirm": 1.0
+    "delay_after_legend_confirm": 1.0,
+    "click_method": "postmessage",
+    "click_restore_after_action": true,
+    "postmessage_fallback_sendinput": false
   }
 }

@@ -8,6 +8,7 @@ block_cipher = None
 hiddenimports = []
 for package in ("dxcam", "mss"):
     hiddenimports += collect_submodules(package)
+hiddenimports += ["czn_gui", "tkinter", "tkinter.ttk"]
 
 a = Analysis(
     ["czn_detector.py"],
