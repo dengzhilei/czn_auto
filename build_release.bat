@@ -13,9 +13,12 @@ python -m pip install -r requirements.txt -r requirements-build.txt
 python -m PyInstaller --clean --noconfirm czn_auto.spec
 
 copy /y start_czn_auto_exe.bat dist\CZNAuto\start_czn_auto.bat >nul
+copy /y start_czn_auto_simplified_exe.bat dist\CZNAuto\start_czn_auto_simplified.bat >nul
+copy /y start_czn_auto_traditional_exe.bat dist\CZNAuto\start_czn_auto_traditional.bat >nul
 copy /y run_one_click_exe.bat dist\CZNAuto\run_one_click.bat >nul
 copy /y stop_czn_auto_exe.bat dist\CZNAuto\stop_czn_auto.bat >nul
 copy /y open_config_exe.bat dist\CZNAuto\open_config.bat >nul
+copy /y choose_ui_language.ps1 dist\CZNAuto\choose_ui_language.ps1 >nul
 copy /y config.example.json dist\CZNAuto\config.example.json >nul
 copy /y config.example.json dist\CZNAuto\config.json >nul
 copy /y CONFIG.md dist\CZNAuto\CONFIG.md >nul

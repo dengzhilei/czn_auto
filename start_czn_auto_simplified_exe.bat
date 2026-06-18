@@ -1,10 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-echo Starting CZN Auto background one-click test.
+echo Starting CZN Auto with Simplified Chinese templates.
 echo Stop keys: F8, ESC, PAUSE, END
 if exist "%~dp0CZNAuto.exe" (
-  CZNAuto.exe --live --act --input-backend postmessage_activate --advance-on-unknown --fast-start-to-team --max-seconds 8 --max-clicks 1
+  CZNAuto.exe --live --act --input-backend postmessage_activate --advance-on-unknown --fast-start-to-team --wide-match-scales --ui-language zh-Hans
 ) else (
   net session >nul 2>nul
   if errorlevel 1 (
@@ -12,6 +12,6 @@ if exist "%~dp0CZNAuto.exe" (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -WorkingDirectory '%~dp0' -Verb RunAs"
     exit /b
   )
-  python czn_detector.py --live --act --input-backend postmessage_activate --advance-on-unknown --fast-start-to-team --max-seconds 8 --max-clicks 1
+  python czn_detector.py --live --act --input-backend postmessage_activate --advance-on-unknown --fast-start-to-team --wide-match-scales --ui-language zh-Hans
 )
 pause

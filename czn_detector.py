@@ -22,7 +22,7 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 _DXGI_CAMERAS: dict[int, object] = {}
 _FORCED_CAPTURE_AREAS: dict[int, dict] = {}
 _RUN_LOG_HANDLE = None
@@ -49,6 +49,32 @@ CAPTURE_METHODS = {
 }
 DEFAULT_MONITOR = "auto"
 DEFAULT_CAPTURE_METHOD = CAPTURE_METHOD_AUTO
+UI_LANGUAGE_AUTO = "auto"
+UI_LANGUAGE_TRADITIONAL = "zh-Hant"
+UI_LANGUAGE_SIMPLIFIED = "zh-Hans"
+UI_LANGUAGES = {
+    UI_LANGUAGE_AUTO,
+    UI_LANGUAGE_TRADITIONAL,
+    UI_LANGUAGE_SIMPLIFIED,
+}
+UI_LANGUAGE_ALIASES = {
+    "auto": UI_LANGUAGE_AUTO,
+    "default": UI_LANGUAGE_AUTO,
+    "traditional": UI_LANGUAGE_TRADITIONAL,
+    "trad": UI_LANGUAGE_TRADITIONAL,
+    "tc": UI_LANGUAGE_TRADITIONAL,
+    "zh-hant": UI_LANGUAGE_TRADITIONAL,
+    "zh_hant": UI_LANGUAGE_TRADITIONAL,
+    "繁体": UI_LANGUAGE_TRADITIONAL,
+    "繁體": UI_LANGUAGE_TRADITIONAL,
+    "simplified": UI_LANGUAGE_SIMPLIFIED,
+    "simp": UI_LANGUAGE_SIMPLIFIED,
+    "sc": UI_LANGUAGE_SIMPLIFIED,
+    "zh-hans": UI_LANGUAGE_SIMPLIFIED,
+    "zh_hans": UI_LANGUAGE_SIMPLIFIED,
+    "简体": UI_LANGUAGE_SIMPLIFIED,
+    "簡體": UI_LANGUAGE_SIMPLIFIED,
+}
 
 WM_ACTIVATE = 0x0006
 WM_MOUSEMOVE = 0x0200
@@ -204,6 +230,7 @@ def print_run_header(args: argparse.Namespace, log_path: Path | None) -> None:
     print(f"frozen={bool(getattr(sys, 'frozen', False))}")
     print(f"python={sys.version.split()[0]} executable={sys.executable}")
     print(f"platform={platform.platform()}")
+    print(f"admin={is_process_admin()}")
     print(f"argv={sys.argv!r}")
     print(f"args={json_safe_args(args)}")
     print(f"config_messages={json.dumps(CONFIG_MESSAGES, ensure_ascii=False)}")
@@ -237,6 +264,13 @@ def display_environment() -> dict:
     except Exception as exc:
         info["mss_monitors_error"] = repr(exc)
     return info
+
+
+def is_process_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def runtime_timing_profile() -> dict:
@@ -293,6 +327,7 @@ def runtime_click_profile() -> dict:
         "input_backend": INPUT_BACKEND,
         "restore_cursor_after_click": RESTORE_CURSOR_AFTER_CLICK,
         "target_window_title": INPUT_TARGET_WINDOW_TITLE,
+        "ui_language": UI_LANGUAGE,
         "advance": CLICK_ADVANCE,
         "choice_right": CLICK_CHOICE_RIGHT,
         "confirm": CLICK_CONFIRM,
@@ -505,6 +540,7 @@ RESTORE_CURSOR_AFTER_CLICK = False
 INPUT_TARGET_WINDOW_TITLE = "卡厄思梦境"
 MONITOR_INDEX = DEFAULT_MONITOR
 CAPTURE_METHOD = DEFAULT_CAPTURE_METHOD
+UI_LANGUAGE = UI_LANGUAGE_AUTO
 _INPUT_TARGET_HWND_CACHE = 0
 
 # 识别等待轮询间隔，用在等待“脱逃页/确认弹窗/回首页”等关键状态。
@@ -614,6 +650,7 @@ CONFIG_BINDINGS = {
         "backend": ("INPUT_BACKEND", "input_backend"),
         "restore_cursor_after_click": ("RESTORE_CURSOR_AFTER_CLICK", "bool"),
         "target_window_title": ("INPUT_TARGET_WINDOW_TITLE", "string"),
+        "ui_language": ("UI_LANGUAGE", "ui_language"),
     },
     "runtime": {
         "monitor": ("MONITOR_INDEX", "monitor"),
@@ -688,10 +725,11 @@ def default_user_config() -> dict:
             "delay_after_legend_confirm": DELAY_AFTER_LEGEND_CONFIRM,
         },
         "input": {
-            "_说明": "输入方式。sendinput 是默认真实鼠标点击；postmessage/postmessage_activate 是实验后台消息点击，可能被游戏忽略。",
+            "_说明": "输入方式。postmessage_activate 是默认后台窗口点击，通常不占用真实鼠标；sendinput 是真实鼠标兼容模式。ui_language 可填 auto、zh-Hant、zh-Hans。",
             "backend": INPUT_BACKEND,
             "restore_cursor_after_click": RESTORE_CURSOR_AFTER_CLICK,
             "target_window_title": INPUT_TARGET_WINDOW_TITLE,
+            "ui_language": UI_LANGUAGE,
         },
         "runtime": {
             "_说明": "运行环境。monitor 默认 auto，会按 target_window_title 自动选择游戏所在屏幕；capture_method 默认 auto，优先使用更适合多屏/窗口模式的 mss。",
@@ -751,6 +789,8 @@ def _coerce_config_value(value: object, kind: str, label: str) -> object:
         if text not in INPUT_BACKENDS:
             raise ValueError(f"{label} must be one of {', '.join(sorted(INPUT_BACKENDS))}")
         return text
+    if kind == "ui_language":
+        return normalize_ui_language(value, label)
     if kind == "capture_method":
         text = str(value).strip().lower().replace("-", "_")
         if text not in CAPTURE_METHODS:
@@ -784,6 +824,16 @@ def _coerce_config_value(value: object, kind: str, label: str) -> object:
     if kind == "string":
         return str(value).strip()
     raise ValueError(f"unknown config type {kind}")
+
+
+def normalize_ui_language(value: object, label: str = "ui_language") -> str:
+    text = str(value).strip()
+    key = text.lower().replace("_", "-")
+    if text in UI_LANGUAGES:
+        return text
+    if key in UI_LANGUAGE_ALIASES:
+        return UI_LANGUAGE_ALIASES[key]
+    raise ValueError(f"{label} must be one of {', '.join(sorted(UI_LANGUAGES))}")
 
 
 def apply_user_config(path: Path, create_missing: bool = True) -> None:
@@ -843,29 +893,63 @@ VK_CODES = {
 
 
 class CznDetector:
-    def __init__(self, template_dir: Path | None = None, wide_match_scales: bool = False) -> None:
+    def __init__(
+        self,
+        template_dir: Path | None = None,
+        wide_match_scales: bool = False,
+        ui_language: str = UI_LANGUAGE_AUTO,
+    ) -> None:
         visible_templates = app_install_dir() / "templates"
         bundled_templates = app_base_dir() / "templates"
         self.template_dir = template_dir or (visible_templates if visible_templates.exists() else bundled_templates)
+        self.ui_language = normalize_ui_language(ui_language)
+        self.template_dirs = self._resolve_template_dirs()
         self.match_scale_factors = WIDE_MATCH_SCALE_FACTORS if wide_match_scales else FAST_MATCH_SCALE_FACTORS
         self._warned_aspect_sizes: set[tuple[int, int]] = set()
-        self.legend_template = self._load_template("legend_word.jpg")
-        self.legend_wide_template = self._load_template("legend_word_wide.jpg")
-        self.dream_template = self._load_template("dream_border_title.jpg")
-        self.card_reward_template = self._load_template("card_reward_title.jpg")
-        self.start_enter_template = self._load_template("start_enter_button.jpg")
-        self.choice_glow_template = self._load_template("choice_bottom_glow.jpg")
-        self.top_right_menu_template = self._load_template("combat_top_right_menu.jpg")
-        self.flee_button_template = self._load_template("flee_button.jpg")
-        self.team_enter_template = self._load_template("team_enter_button.jpg")
-        self.return_confirm_template = self._load_template("return_confirm_button.jpg")
+        self.legend_templates = self._load_template_variants("legend_word.jpg", "legend_word")
+        self.legend_templates += self._load_template_variants("legend_word_wide.jpg", "legend_word_wide")
+        self.dream_templates = self._load_template_variants("dream_border_title.jpg", "dream_border_title")
+        self.card_reward_templates = self._load_template_variants("card_reward_title.jpg", "card_reward_title")
+        self.start_enter_templates = self._load_template_variants("start_enter_button.jpg", "start_enter_button")
+        self.choice_glow_templates = self._load_template_variants("choice_bottom_glow.jpg", "choice_bottom_glow")
+        self.top_right_menu_templates = self._load_template_variants("combat_top_right_menu.jpg", "top_right_menu")
+        self.flee_button_templates = self._load_template_variants("flee_button.jpg", "flee_button")
+        self.team_enter_templates = self._load_template_variants("team_enter_button.jpg", "team_enter_button")
+        self.return_confirm_templates = self._load_template_variants("return_confirm_button.jpg", "return_confirm_button")
 
-    def _load_template(self, name: str) -> np.ndarray:
-        path = self.template_dir / name
-        image = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise FileNotFoundError(f"template not found or unreadable: {path}")
-        return image
+    def _resolve_template_dirs(self) -> list[Path]:
+        if self.ui_language == UI_LANGUAGE_AUTO:
+            candidates = [
+                self.template_dir / UI_LANGUAGE_SIMPLIFIED,
+                self.template_dir / UI_LANGUAGE_TRADITIONAL,
+                self.template_dir,
+            ]
+        else:
+            candidates = [
+                self.template_dir / self.ui_language,
+                self.template_dir,
+            ]
+        dirs: list[Path] = []
+        for path in candidates:
+            if path.exists() and path not in dirs:
+                dirs.append(path)
+        return dirs or [self.template_dir]
+
+    def _load_template_variants(self, filename: str, name: str) -> list[tuple[str, np.ndarray]]:
+        templates: list[tuple[str, np.ndarray]] = []
+        for directory in self.template_dirs:
+            path = directory / filename
+            if not path.exists():
+                continue
+            image = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise FileNotFoundError(f"template not found or unreadable: {path}")
+            suffix = directory.name if directory != self.template_dir else "base"
+            templates.append((f"{name}:{suffix}", image))
+        if not templates:
+            searched = ", ".join(str(directory / filename) for directory in self.template_dirs)
+            raise FileNotFoundError(f"template not found or unreadable: {searched}")
+        return templates
 
     def detect(self, frame_bgr: np.ndarray, warn_aspect: bool = True) -> DetectionState:
         frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -874,7 +958,7 @@ class CznDetector:
             self._warn_if_unexpected_aspect(w, h)
         dream = self._match_in_roi(
             frame_gray,
-            self.dream_template,
+            self.dream_templates,
             CARD_REWARD_ROI,
             "dream_border_title",
             threshold=0.78,
@@ -884,7 +968,7 @@ class CznDetector:
 
         card_reward = self._match_in_roi(
             frame_gray,
-            self.card_reward_template,
+            self.card_reward_templates,
             Box(0.38, 0.06, 0.62, 0.20),
             "card_reward_title",
             threshold=0.72,
@@ -892,7 +976,7 @@ class CznDetector:
         if card_reward:
             top_right_menu = self._match_in_roi(
                 frame_gray,
-                self.top_right_menu_template,
+                self.top_right_menu_templates,
                 Box(0.85, 0.00, 0.995, 0.11),
                 "top_right_menu",
                 threshold=0.70,
@@ -901,7 +985,7 @@ class CznDetector:
 
         return_confirm = self._match_in_roi(
             frame_gray,
-            self.return_confirm_template,
+            self.return_confirm_templates,
             Box(0.40, 0.56, 0.86, 0.76),
             "return_confirm_button",
             threshold=0.78,
@@ -911,19 +995,26 @@ class CznDetector:
 
         legend = self._best_match(
             frame_gray=frame_gray,
-            templates=[
-                ("legend_word", self.legend_template),
-                ("legend_word_wide", self.legend_wide_template),
-            ],
+            templates=self.legend_templates,
             roi=CHOICE_RIGHT_ROI,
             threshold=0.72,
         )
         if legend:
             return detection_state(legend_choice=legend)
 
+        flee_button = self._match_in_roi(
+            frame_gray,
+            self.flee_button_templates,
+            Box(0.70, 0.82, 0.995, 0.995),
+            "flee_button",
+            threshold=0.84,
+        )
+        if flee_button:
+            return detection_state(flee_button=flee_button)
+
         team_enter = self._match_in_roi(
             frame_gray,
-            self.team_enter_template,
+            self.team_enter_templates,
             Box(0.74, 0.84, 0.995, 0.995),
             "team_enter_button",
             threshold=0.74,
@@ -933,7 +1024,7 @@ class CznDetector:
 
         start_screen = self._match_in_roi(
             frame_gray,
-            self.start_enter_template,
+            self.start_enter_templates,
             Box(0.70, 0.82, 0.995, 0.99),
             "start_enter_button",
             threshold=0.72,
@@ -953,16 +1044,6 @@ class CznDetector:
         if choice_card:
             return detection_state(choice_card=choice_card)
 
-        flee_button = self._match_in_roi(
-            frame_gray,
-            self.flee_button_template,
-            Box(0.70, 0.82, 0.995, 0.995),
-            "flee_button",
-            threshold=0.72,
-        )
-        if flee_button:
-            return detection_state(flee_button=flee_button)
-
         return detection_state()
 
     def _detect_choice_anchors(self, frame_gray: np.ndarray, allow_layout: bool = True) -> MatchResult | None:
@@ -976,7 +1057,7 @@ class CznDetector:
         for index, roi in enumerate(glow_rois, start=1):
             match = self._match_in_roi(
                 frame_gray,
-                self.choice_glow_template,
+                self.choice_glow_templates,
                 roi,
                 f"choice_glow_{index}",
                 threshold=0.55,
@@ -1141,11 +1222,19 @@ class CznDetector:
     def _match_in_roi(
         self,
         frame_gray: np.ndarray,
-        template_gray: np.ndarray,
+        template_gray: np.ndarray | list[tuple[str, np.ndarray]],
         roi: Box,
         name: str,
         threshold: float,
     ) -> MatchResult | None:
+        if isinstance(template_gray, list):
+            best: MatchResult | None = None
+            for variant_name, variant in template_gray:
+                match = self._match_in_roi(frame_gray, variant, roi, variant_name, threshold)
+                if match and (best is None or match.score > best.score):
+                    best = match
+            return best
+
         h, w = frame_gray.shape[:2]
         x1, y1, x2, y2 = roi.to_pixels(w, h)
         haystack = frame_gray[y1:y2, x1:x2]
@@ -2257,19 +2346,28 @@ def post_message_click_screen_xy(x: int, y: int, duration: float = 0.08, activat
         return
     user32 = ctypes.windll.user32
     if activate:
+        ctypes.set_last_error(0)
         user32.PostMessageW(target, WM_ACTIVATE, WA_ACTIVE, 0)
         time.sleep(0.01)
     cx, cy = _screen_to_client(target, x, y)
     lparam = _make_lparam(cx, cy)
+    ctypes.set_last_error(0)
     ok_move = user32.PostMessageW(target, WM_MOUSEMOVE, 0, lparam)
+    err_move = ctypes.get_last_error()
+    ctypes.set_last_error(0)
     ok_down = user32.PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+    err_down = ctypes.get_last_error()
     time.sleep(duration)
+    ctypes.set_last_error(0)
     ok_up = user32.PostMessageW(target, WM_LBUTTONUP, 0, lparam)
+    err_up = ctypes.get_last_error()
     time.sleep(CLICK_AFTER_UP_DELAY)
     if not (ok_move and ok_down and ok_up):
         print(
             f"postmessage click warning: target=0x{target:x} client=({cx},{cy}) "
-            f"ok_move={ok_move} ok_down={ok_down} ok_up={ok_up}",
+            f"ok_move={ok_move} err_move={err_move} "
+            f"ok_down={ok_down} err_down={err_down} "
+            f"ok_up={ok_up} err_up={err_up}",
             flush=True,
         )
 
@@ -2484,7 +2582,9 @@ class LiveSession:
             f"stop_file={cfg.stop_file}"
         )
         print(
-            f"detector: template_dir={cfg.detector.template_dir}, "
+            f"detector: ui_language={cfg.detector.ui_language}, "
+            f"template_dir={cfg.detector.template_dir}, "
+            f"template_dirs={[str(path) for path in cfg.detector.template_dirs]}, "
             f"match_scale_factors={cfg.detector.match_scale_factors}"
         )
         if cfg.stop_file and cfg.stop_file.exists():
@@ -3140,6 +3240,12 @@ def main() -> None:
         help="Prefer a visible window whose title contains this text for postmessage clicks.",
     )
     parser.add_argument(
+        "--ui-language",
+        choices=sorted(UI_LANGUAGES),
+        default=UI_LANGUAGE,
+        help="UI template language. auto tries language subfolders plus base templates.",
+    )
+    parser.add_argument(
         "--monitor",
         default=MONITOR_INDEX,
         help="monitor index, or auto to use the target game window. Defaults to runtime.monitor in config.",
@@ -3177,6 +3283,7 @@ def main() -> None:
     globals()["INPUT_BACKEND"] = args.input_backend
     globals()["RESTORE_CURSOR_AFTER_CLICK"] = args.restore_cursor_after_click
     globals()["INPUT_TARGET_WINDOW_TITLE"] = args.target_window_title.strip()
+    globals()["UI_LANGUAGE"] = args.ui_language
 
     log_path = None
     if not args.no_run_log:
@@ -3187,7 +3294,7 @@ def main() -> None:
         parser.error(str(exc))
     print_run_header(args, log_path)
 
-    detector = CznDetector(wide_match_scales=args.wide_match_scales)
+    detector = CznDetector(wide_match_scales=args.wide_match_scales, ui_language=args.ui_language)
     if args.image:
         run_image(detector, args.image, args.out_dir)
     elif args.video:

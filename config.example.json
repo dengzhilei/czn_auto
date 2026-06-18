@@ -63,10 +63,11 @@
     "delay_after_legend_confirm": 1.0
   },
   "input": {
-    "_说明": "输入方式。postmessage_activate 是默认后台窗口点击，通常不占用真实鼠标；sendinput 是真实鼠标兼容模式。",
+    "_说明": "输入方式。postmessage_activate 是默认后台窗口点击，通常不占用真实鼠标；sendinput 是真实鼠标兼容模式。ui_language 可填 auto、zh-Hant、zh-Hans。",
     "backend": "postmessage_activate",
     "restore_cursor_after_click": false,
-    "target_window_title": "卡厄思梦境"
+    "target_window_title": "卡厄思梦境",
+    "ui_language": "auto"
   },
   "runtime": {
     "_说明": "运行环境。monitor 默认 auto，会按 target_window_title 自动选择游戏所在屏幕；capture_method 默认 auto，优先使用更适合多屏/窗口模式的 mss。",
