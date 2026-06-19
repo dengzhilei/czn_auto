@@ -560,6 +560,7 @@ LEGEND_CONFIRM_DELAY = 0.20
 CHOICE_SETTLE_BEFORE_ACTION = 0.35
 CHOICE_NO_LEGEND_ACTION_THRESHOLD = 0.70
 START_TO_TEAM_CHOICE_GUARD_SECONDS = 8.0
+MENU_TO_FLEE_GUARD_SECONDS = 8.0
 
 # 点击函数内部固定耗时。一次点击大约是：
 # CLICK_MOVE_DELAY + CLICK_ABSOLUTE_MOVE_DELAY + duration + CLICK_AFTER_UP_DELAY。
@@ -1015,10 +1016,6 @@ class CznDetector:
         if team_enter:
             return detection_state(team_enter=team_enter)
 
-        choice_card = self._detect_choice_anchors(frame_gray, allow_layout=False)
-        if choice_card:
-            return detection_state(choice_card=choice_card)
-
         flee_button = self._match_in_roi(
             frame_gray,
             self.flee_button_templates,
@@ -1028,6 +1025,10 @@ class CznDetector:
         )
         if flee_button:
             return detection_state(flee_button=flee_button)
+
+        choice_card = self._detect_choice_anchors(frame_gray, allow_layout=False)
+        if choice_card:
+            return detection_state(choice_card=choice_card)
 
         start_screen = self._match_in_roi(
             frame_gray,
@@ -2625,6 +2626,8 @@ class LiveRuntime:
     expected_transition: ExpectedTransition | None = None
     window_probe_attempted: bool = False
     choice_guard_until: float = 0.0
+    menu_to_flee_guard_until: float = 0.0
+    menu_to_flee_fallback_clicked: bool = False
 
 
 class LiveSession:
@@ -2924,6 +2927,7 @@ class LiveSession:
             )
 
     def handle_state(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
+        rt = self.runtime
         if state.choice_card and now < self.runtime.choice_guard_until:
             remaining = self.runtime.choice_guard_until - now
             print(
@@ -2931,6 +2935,29 @@ class LiveSession:
                 f"({remaining:.1f}s left); waiting for team/transition state."
             )
             self.mark_action(now, self.config.interval)
+            return True
+        if (
+            state.choice_card
+            and now < rt.menu_to_flee_guard_until
+            and state.choice_card.score < CHOICE_NO_LEGEND_ACTION_THRESHOLD
+        ):
+            remaining = rt.menu_to_flee_guard_until - now
+            print(
+                "weak choice screen ignored during menu->flee guard "
+                f"({state.choice_card.score:.3f}, {remaining:.1f}s left)."
+            )
+            if self.config.act and not rt.menu_to_flee_fallback_clicked:
+                print_action("menu->flee guard: click fixed flee fallback", CHAIN_FLEE_POINT, self.config.act)
+                click_norm(CHAIN_FLEE_POINT, monitor, duration=CHAIN_CLICK_DURATION)
+                rt.click_count += 1
+                rt.menu_to_flee_fallback_clicked = True
+                self.expect_transition(
+                    "menu_to_flee_guard",
+                    "choice_screen",
+                    {"flee_screen", "return_confirm", "start_screen", "team_screen", "unknown"},
+                    max(self.config.post_click_wait, 2.0),
+                )
+            self.mark_action(now, DELAY_AFTER_NO_LEGEND_CHAIN)
             return True
         if state.dream_card:
             return self.handle_dream_card()
@@ -2988,6 +3015,8 @@ class LiveSession:
                 else:
                     click_norm(CLICK_RETRY_TOP_RIGHT, monitor)
                 rt.click_count += 1
+                rt.menu_to_flee_guard_until = time.time() + MENU_TO_FLEE_GUARD_SECONDS
+                rt.menu_to_flee_fallback_clicked = False
                 self.wait_visual(frame, "reward_retry", {"flee_screen", "start_screen", "team_screen", "unknown"})
         elif cfg.no_dream_action == "confirm":
             print_action("no dream card: click confirm", CLICK_CONFIRM, cfg.act)
@@ -3004,12 +3033,15 @@ class LiveSession:
 
     def handle_return_confirm(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
         cfg = self.config
+        rt = self.runtime
         self.reset_common()
+        rt.menu_to_flee_guard_until = 0.0
+        rt.menu_to_flee_fallback_clicked = False
         confirm_point = state.return_confirm.point_at(0.68, 0.50)
         print_action(f"return confirm: click confirm at {confirm_point}", CLICK_CONFIRM, cfg.act)
         if cfg.act:
             click_frame_point(confirm_point, monitor)
-            self.runtime.click_count += 1
+            rt.click_count += 1
             self.wait_visual(frame, "return_confirm", {"start_screen", "team_screen", "unknown"})
         self.mark_action(now, DELAY_AFTER_RETURN_CONFIRM)
         return True
@@ -3094,12 +3126,15 @@ class LiveSession:
 
     def handle_flee_screen(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
         cfg = self.config
+        rt = self.runtime
         self.reset_common()
+        rt.menu_to_flee_guard_until = 0.0
+        rt.menu_to_flee_fallback_clicked = False
         flee_point = state.flee_button.point_at(0.72, 0.50)
         print_action(f"flee screen: click flee text area at {flee_point}", CLICK_ADVANCE, cfg.act)
         if cfg.act:
             click_frame_point(flee_point, monitor)
-            self.runtime.click_count += 1
+            rt.click_count += 1
             self.wait_visual(frame, "flee", {"return_confirm", "unknown"})
         self.mark_action(now, DELAY_AFTER_FLEE)
         return True
