@@ -1,5 +1,5 @@
 #define MyAppName "CZN Auto"
-#define MyAppVersion "0.1.13"
+#define MyAppVersion "0.1.14"
 #define MyAppPublisher "dengzhilei"
 #define MyAppExeName "CZNAuto.exe"
 
