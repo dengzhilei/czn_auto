@@ -22,7 +22,7 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.12"
 _DXGI_CAMERAS: dict[int, object] = {}
 _FORCED_CAPTURE_AREAS: dict[int, dict] = {}
 _RUN_LOG_HANDLE = None
@@ -465,6 +465,7 @@ def detection_state(
 
 CHOICE_RIGHT_ROI = Box(2440 / BASE_W, 1600 / BASE_H, 3430 / BASE_W, 2050 / BASE_H)
 CARD_REWARD_ROI = Box(560 / BASE_W, 470 / BASE_H, 3300 / BASE_W, 920 / BASE_H)
+START_SCREEN_THRESHOLD = 0.80
 
 CLICK_ADVANCE = (0.935, 0.855)
 CLICK_CHOICE_RIGHT = (0.765, 0.860)
@@ -1002,6 +1003,10 @@ class CznDetector:
         if legend:
             return detection_state(legend_choice=legend)
 
+        choice_card = self._detect_choice_anchors(frame_gray, allow_layout=False)
+        if choice_card:
+            return detection_state(choice_card=choice_card)
+
         flee_button = self._match_in_roi(
             frame_gray,
             self.flee_button_templates,
@@ -1027,14 +1032,10 @@ class CznDetector:
             self.start_enter_templates,
             Box(0.70, 0.82, 0.995, 0.99),
             "start_enter_button",
-            threshold=0.72,
+            threshold=START_SCREEN_THRESHOLD,
         )
         if start_screen:
             return detection_state(start_screen=start_screen)
-
-        choice_card = self._detect_choice_anchors(frame_gray, allow_layout=False)
-        if choice_card:
-            return detection_state(choice_card=choice_card)
 
         dialog_indicator = self._detect_dialog_indicator(frame_gray)
         if dialog_indicator:
@@ -1044,6 +1045,22 @@ class CznDetector:
         if choice_card:
             return detection_state(choice_card=choice_card)
 
+        return detection_state()
+
+    def detect_start_screen_only(self, frame_bgr: np.ndarray, warn_aspect: bool = False) -> DetectionState:
+        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = frame_bgr.shape[:2]
+        if warn_aspect:
+            self._warn_if_unexpected_aspect(w, h)
+        start_screen = self._match_in_roi(
+            frame_gray,
+            self.start_enter_templates,
+            Box(0.70, 0.82, 0.995, 0.99),
+            "start_enter_button",
+            threshold=START_SCREEN_THRESHOLD,
+        )
+        if start_screen:
+            return detection_state(start_screen=start_screen)
         return detection_state()
 
     def _detect_choice_anchors(self, frame_gray: np.ndarray, allow_layout: bool = True) -> MatchResult | None:
@@ -2198,7 +2215,7 @@ def _window_title_matches_target(title: str) -> bool:
     return bool(needle and needle in title.lower())
 
 
-def _visible_game_window_candidates(monitor: dict) -> list[tuple[int, dict]]:
+def _visible_game_window_candidates(monitor: dict, require_title_match: bool = True) -> list[tuple[int, dict]]:
     user32 = ctypes.windll.user32
     candidates: list[tuple[int, dict]] = []
 
@@ -2213,7 +2230,7 @@ def _visible_game_window_candidates(monitor: dict) -> list[tuple[int, dict]]:
             return True
         area = dict(area)
         title = _window_title(hwnd)
-        if INPUT_TARGET_WINDOW_TITLE.strip() and not _window_title_matches_target(title):
+        if require_title_match and INPUT_TARGET_WINDOW_TITLE.strip() and not _window_title_matches_target(title):
             return True
         area["hwnd"] = int(hwnd)
         area["title"] = title
@@ -2231,19 +2248,37 @@ def _visible_game_window_candidates(monitor: dict) -> list[tuple[int, dict]]:
     return candidates
 
 
-def probe_game_window_capture(detector: CznDetector, capture_method: str) -> CaptureProbe | None:
+def probe_game_window_capture(
+    detector: CznDetector,
+    capture_method: str,
+    require_title_match: bool = False,
+    start_screen_only: bool = True,
+) -> CaptureProbe | None:
     probes: list[CaptureProbe] = []
+    scanned_candidates = 0
     for monitor_index, monitor in enumerate(_available_monitors()[1:], start=1):
         try:
             base_frame, base_monitor = _screen_shot_mss(monitor_index)
         except Exception as exc:
             print(f"window probe: failed to capture monitor {monitor_index}: {exc}", flush=True)
             continue
-        for _hwnd, area in _visible_game_window_candidates(base_monitor):
+        candidates = _visible_game_window_candidates(base_monitor, require_title_match=require_title_match)
+        if not candidates:
+            print(
+                "window probe: no visible game-like window candidates "
+                f"on monitor {monitor_index} (require_title_match={require_title_match})",
+                flush=True,
+            )
+        for _hwnd, area in candidates:
+            scanned_candidates += 1
             frame, cropped_monitor = _crop_frame_to_area(base_frame, base_monitor, area)
             if frame.shape[:2] == base_frame.shape[:2]:
                 continue
-            state = detector.detect(frame, warn_aspect=False)
+            state = (
+                detector.detect_start_screen_only(frame, warn_aspect=False)
+                if start_screen_only
+                else detector.detect(frame, warn_aspect=False)
+            )
             if state.label == "unknown":
                 continue
             title_match = INPUT_TARGET_WINDOW_TITLE.strip().lower() in area.get("title", "").lower()
@@ -2263,6 +2298,11 @@ def probe_game_window_capture(detector: CznDetector, capture_method: str) -> Cap
                 )
             )
     if not probes:
+        print(
+            "window probe: no start screen matched "
+            f"among {scanned_candidates} game-like window candidates",
+            flush=True,
+        )
         return None
     probes.sort(key=lambda probe: probe.score, reverse=True)
     best = probes[0]
@@ -2314,12 +2354,30 @@ def message_target_at(x: int, y: int) -> int:
         hwnd = _cached_title_window(INPUT_TARGET_WINDOW_TITLE, x, y)
         if hwnd:
             return _message_target_for(hwnd)
+        forced_hwnd = _forced_area_hwnd_at(x, y)
+        if forced_hwnd:
+            return _message_target_for(forced_hwnd)
         print(
             f"postmessage target title not found at ({x},{y}): {INPUT_TARGET_WINDOW_TITLE!r}; "
             "falling back to WindowFromPoint",
             flush=True,
         )
     return _message_target_for(window_at(x, y))
+
+
+def _forced_area_hwnd_at(x: int, y: int) -> int:
+    user32 = ctypes.windll.user32
+    for area in _FORCED_CAPTURE_AREAS.values():
+        hwnd = int(area.get("hwnd") or 0)
+        if not hwnd or not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+            continue
+        left = int(area.get("left", 0))
+        top = int(area.get("top", 0))
+        right = left + int(area.get("width", 0))
+        bottom = top + int(area.get("height", 0))
+        if left <= x < right and top <= y < bottom:
+            return hwnd
+    return 0
 
 
 def _message_target_for(hwnd: int) -> int:
@@ -2599,7 +2657,7 @@ class LiveSession:
                     print(f"using monitor {cfg.monitor_index}: {monitor}; frame_shape={frame.shape}")
                     self.runtime.printed_monitor = True
                 state = cfg.detector.detect(frame)
-                if state.label == "unknown" and not self.runtime.window_probe_attempted:
+                if self.should_probe_window(state, frame, monitor):
                     self.runtime.window_probe_attempted = True
                     probe = probe_game_window_capture(cfg.detector, cfg.capture_method)
                     if probe:
@@ -2633,6 +2691,28 @@ class LiveSession:
             return True
         if cfg.max_clicks > 0 and rt.click_count >= cfg.max_clicks:
             print("live mode max clicks reached; exiting.")
+            return True
+        return False
+
+    def should_probe_window(self, state: DetectionState, frame: np.ndarray, monitor: dict) -> bool:
+        if self.runtime.window_probe_attempted:
+            return False
+        if monitor.get("source") == "target_window_client_capture":
+            return False
+        if state.label == "unknown":
+            return True
+
+        h, w = frame.shape[:2]
+        aspect = w / max(1, h)
+        if abs(aspect - BASE_ASPECT) <= 0.08:
+            return False
+
+        if state.label in {"choice_screen", "start_screen", "team_screen"}:
+            print(
+                "window probe: current capture aspect looks like full desktop "
+                f"({w}x{h}, aspect={aspect:.3f}); probing visible windows before trusting {state.label}.",
+                flush=True,
+            )
             return True
         return False
 
@@ -3180,7 +3260,25 @@ def print_action(label: str, point: tuple[float, float], act: bool) -> None:
     print(f"{mode}: {label} at normalized {point}", flush=True)
 
 
+DEFAULT_NO_ARGS = [
+    "--live",
+    "--act",
+    "--input-backend",
+    INPUT_BACKEND_POSTMESSAGE_ACTIVATE,
+    "--advance-on-unknown",
+    "--fast-start-to-team",
+    "--wide-match-scales",
+]
+
+
 def main() -> None:
+    if len(sys.argv) == 1 and getattr(sys, "frozen", False):
+        sys.argv.extend(DEFAULT_NO_ARGS)
+        print(
+            "No command-line arguments supplied; using default live automation mode.",
+            flush=True,
+        )
+
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=Path, default=default_config_file())
     pre_parser.add_argument("--no-user-config", action="store_true")
@@ -3210,6 +3308,12 @@ def main() -> None:
     parser.add_argument("--max-seconds", type=float, default=0.0, help="Stop live mode after this many seconds. 0 means run until stopped/found.")
     parser.add_argument("--max-clicks", type=int, default=0, help="Stop live mode after this many actual clicks. 0 means unlimited.")
     parser.add_argument("--post-click-wait", type=float, default=POST_CLICK_WAIT, help="Wait this many seconds after each click for a real visual change.")
+    parser.add_argument(
+        "--reward-settle-before-action",
+        type=float,
+        default=REWARD_SETTLE_BEFORE_ACTION,
+        help="Seconds to wait on the final card reward screen before checking for the dream card.",
+    )
     parser.add_argument(
         "--wait-after-team-enter",
         type=float,
@@ -3280,10 +3384,13 @@ def main() -> None:
         help="What live mode should do on a card reward screen when 梦之边境 is not detected.",
     )
     args = parser.parse_args()
+    if args.reward_settle_before_action < 0:
+        parser.error("--reward-settle-before-action must be >= 0")
     globals()["INPUT_BACKEND"] = args.input_backend
     globals()["RESTORE_CURSOR_AFTER_CLICK"] = args.restore_cursor_after_click
     globals()["INPUT_TARGET_WINDOW_TITLE"] = args.target_window_title.strip()
     globals()["UI_LANGUAGE"] = args.ui_language
+    globals()["REWARD_SETTLE_BEFORE_ACTION"] = args.reward_settle_before_action
 
     log_path = None
     if not args.no_run_log:
