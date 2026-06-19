@@ -22,7 +22,7 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
-APP_VERSION = "0.1.12"
+APP_VERSION = "0.1.13"
 _DXGI_CAMERAS: dict[int, object] = {}
 _FORCED_CAPTURE_AREAS: dict[int, dict] = {}
 _RUN_LOG_HANDLE = None
@@ -558,6 +558,8 @@ VISUAL_CHANGE_POLL_INTERVAL = 0.20
 # 传说选项：点选项卡后，等对勾出现/可点的短暂停顿。
 LEGEND_CONFIRM_DELAY = 0.20
 CHOICE_SETTLE_BEFORE_ACTION = 0.35
+CHOICE_NO_LEGEND_ACTION_THRESHOLD = 0.70
+START_TO_TEAM_CHOICE_GUARD_SECONDS = 8.0
 
 # 点击函数内部固定耗时。一次点击大约是：
 # CLICK_MOVE_DELAY + CLICK_ABSOLUTE_MOVE_DELAY + duration + CLICK_AFTER_UP_DELAY。
@@ -1870,6 +1872,13 @@ def fast_abandon_no_legend(
             f"({state.choice_card.name}); not clicking top-right menu."
         )
         return 0
+    if state.choice_card.score < CHOICE_NO_LEGEND_ACTION_THRESHOLD:
+        print(
+            "no legend chain skipped: weak choice_glows score "
+            f"{state.choice_card.score:.3f} < {CHOICE_NO_LEGEND_ACTION_THRESHOLD:.2f}; "
+            "waiting for a cleaner choice screen."
+        )
+        return 0
     retry_point = state.top_right_menu.center if state.top_right_menu else None
     print_action("no legend chain: click top-right menu", CLICK_RETRY_TOP_RIGHT, act)
     if act:
@@ -2615,6 +2624,7 @@ class LiveRuntime:
     dialog_advance_armed: bool = False
     expected_transition: ExpectedTransition | None = None
     window_probe_attempted: bool = False
+    choice_guard_until: float = 0.0
 
 
 class LiveSession:
@@ -2914,6 +2924,14 @@ class LiveSession:
             )
 
     def handle_state(self, frame: np.ndarray, monitor: dict, state: DetectionState, now: float) -> bool:
+        if state.choice_card and now < self.runtime.choice_guard_until:
+            remaining = self.runtime.choice_guard_until - now
+            print(
+                "choice screen ignored during start->team guard "
+                f"({remaining:.1f}s left); waiting for team/transition state."
+            )
+            self.mark_action(now, self.config.interval)
+            return True
         if state.dream_card:
             return self.handle_dream_card()
         if state.card_reward:
@@ -3090,6 +3108,7 @@ class LiveSession:
         cfg = self.config
         rt = self.runtime
         self.reset_common(dialog=False)
+        rt.choice_guard_until = 0.0
         click_point = state.team_enter.point_at(*BUTTON_TEXT_POINT)
         print_action(f"team screen: click enter at {click_point}", CLICK_START_ENTER, cfg.act)
         if cfg.act:
@@ -3111,6 +3130,7 @@ class LiveSession:
         cfg = self.config
         rt = self.runtime
         self.reset_common(dialog=False)
+        rt.choice_guard_until = 0.0
         print(
             "start template matched the lower-left team row; treating this as team screen "
             f"fallback. match={state.start_screen.center if state.start_screen else None}"
@@ -3164,6 +3184,8 @@ class LiveSession:
                 click_frame_point(click_point, monitor)
                 rt.click_count += 1
                 self.wait_visual(frame, "start_enter", {"team_screen", "unknown"})
+        if cfg.act:
+            rt.choice_guard_until = time.time() + START_TO_TEAM_CHOICE_GUARD_SECONDS
         rt.handled_start_screen = True
         self.mark_action(now, DELAY_AFTER_START_ENTER)
         return True
