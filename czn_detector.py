@@ -1005,6 +1005,16 @@ class CznDetector:
         if legend:
             return detection_state(legend_choice=legend)
 
+        team_enter = self._match_in_roi(
+            frame_gray,
+            self.team_enter_templates,
+            Box(0.74, 0.84, 0.995, 0.995),
+            "team_enter_button",
+            threshold=0.74,
+        )
+        if team_enter:
+            return detection_state(team_enter=team_enter)
+
         choice_card = self._detect_choice_anchors(frame_gray, allow_layout=False)
         if choice_card:
             return detection_state(choice_card=choice_card)
@@ -1018,16 +1028,6 @@ class CznDetector:
         )
         if flee_button:
             return detection_state(flee_button=flee_button)
-
-        team_enter = self._match_in_roi(
-            frame_gray,
-            self.team_enter_templates,
-            Box(0.74, 0.84, 0.995, 0.995),
-            "team_enter_button",
-            threshold=0.74,
-        )
-        if team_enter:
-            return detection_state(team_enter=team_enter)
 
         start_screen = self._match_in_roi(
             frame_gray,
