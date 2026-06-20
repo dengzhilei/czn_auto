@@ -22,7 +22,7 @@ BASE_W = 3840
 BASE_H = 2160
 BASE_ASPECT = BASE_W / BASE_H
 ASPECT_TOLERANCE = 0.03
-APP_VERSION = "0.1.14"
+APP_VERSION = "0.1.15"
 _DXGI_CAMERAS: dict[int, object] = {}
 _FORCED_CAPTURE_AREAS: dict[int, dict] = {}
 _RUN_LOG_HANDLE = None
@@ -558,7 +558,7 @@ VISUAL_CHANGE_POLL_INTERVAL = 0.20
 # 传说选项：点选项卡后，等对勾出现/可点的短暂停顿。
 LEGEND_CONFIRM_DELAY = 0.20
 CHOICE_SETTLE_BEFORE_ACTION = 0.35
-CHOICE_NO_LEGEND_ACTION_THRESHOLD = 0.70
+MENU_TO_FLEE_CHOICE_IGNORE_THRESHOLD = 0.70
 START_TO_TEAM_CHOICE_GUARD_SECONDS = 8.0
 MENU_TO_FLEE_GUARD_SECONDS = 8.0
 
@@ -1873,13 +1873,6 @@ def fast_abandon_no_legend(
             f"({state.choice_card.name}); not clicking top-right menu."
         )
         return 0
-    if state.choice_card.score < CHOICE_NO_LEGEND_ACTION_THRESHOLD:
-        print(
-            "no legend chain skipped: weak choice_glows score "
-            f"{state.choice_card.score:.3f} < {CHOICE_NO_LEGEND_ACTION_THRESHOLD:.2f}; "
-            "waiting for a cleaner choice screen."
-        )
-        return 0
     retry_point = state.top_right_menu.center if state.top_right_menu else None
     print_action("no legend chain: click top-right menu", CLICK_RETRY_TOP_RIGHT, act)
     if act:
@@ -2939,7 +2932,7 @@ class LiveSession:
         if (
             state.choice_card
             and now < rt.menu_to_flee_guard_until
-            and state.choice_card.score < CHOICE_NO_LEGEND_ACTION_THRESHOLD
+            and state.choice_card.score < MENU_TO_FLEE_CHOICE_IGNORE_THRESHOLD
         ):
             remaining = rt.menu_to_flee_guard_until - now
             print(
